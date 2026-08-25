@@ -1,0 +1,274 @@
+{
+  "info": {
+    "_postman_id": "5433503b-1421-4fa7-96a7-13f94214614e",
+    "name": "Flash Sale API (Lite)",
+    "description": "Minimal Postman v2.0.0 collection for VS Code Postman extension. Requests go through Nginx on `:80`. Set the `baseUrl` variable before running.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json"
+  },
+  "variable": [
+    {
+      "id": "var-baseUrl",
+      "key": "baseUrl",
+      "value": "http://localhost",
+      "type": "string"
+    },
+    {
+      "id": "var-adminUrl",
+      "key": "adminUrl",
+      "value": "http://localhost:3001",
+      "type": "string"
+    },
+    {
+      "id": "var-userId",
+      "key": "userId",
+      "value": "user-1",
+      "type": "string"
+    },
+    {
+      "id": "var-productId",
+      "key": "productId",
+      "value": "p-1001",
+      "type": "string"
+    },
+    {
+      "id": "var-accessToken",
+      "key": "accessToken",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "id": "req-health",
+      "name": "01 GET /health",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["health"]
+        }
+      }
+    },
+    {
+      "id": "req-auth",
+      "name": "02 POST /auth/token",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"userId\": \"{{userId}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/auth/token",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "auth", "token"]
+        }
+      }
+    },
+    {
+      "id": "req-auth-invalid",
+      "name": "02b POST /auth/token (empty, expect 400)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"userId\": \"\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/auth/token",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "auth", "token"]
+        }
+      }
+    },
+    {
+      "id": "req-products-default",
+      "name": "03 GET /products (page=1, limit=10)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/products?page=1&limit=10",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "products"],
+          "query": [
+            { "key": "page", "value": "1" },
+            { "key": "limit", "value": "10" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "req-products-cache-hit",
+      "name": "03b GET /products (cache HIT — same params)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/products?page=1&limit=10",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "products"],
+          "query": [
+            { "key": "page", "value": "1" },
+            { "key": "limit", "value": "10" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "req-products-page2",
+      "name": "03c GET /products (page=2, limit=5)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/products?page=2&limit=5",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "products"],
+          "query": [
+            { "key": "page", "value": "2" },
+            { "key": "limit", "value": "5" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "req-products-invalid",
+      "name": "03d GET /products (limit=999, expect 400)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/products?page=1&limit=999",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "products"],
+          "query": [
+            { "key": "page", "value": "1" },
+            { "key": "limit", "value": "999" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "req-order",
+      "name": "04 POST /orders (expect 202)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer {{accessToken}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"productId\": \"{{productId}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/orders",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "orders"]
+        }
+      }
+    },
+    {
+      "id": "req-order-dup",
+      "name": "04b POST /orders (duplicate, expect 409)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer {{accessToken}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"productId\": \"{{productId}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/orders",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "orders"]
+        }
+      }
+    },
+    {
+      "id": "req-order-noauth",
+      "name": "04c POST /orders (no auth, expect 401)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"productId\": \"{{productId}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/orders",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "orders"]
+        }
+      }
+    },
+    {
+      "id": "req-order-bad-token",
+      "name": "04d POST /orders (bad token, expect 401)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer not-a-real-jwt"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"productId\": \"{{productId}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/orders",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "orders"]
+        }
+      }
+    },
+    {
+      "id": "req-bull-board",
+      "name": "05 GET /admin/queues (Bull-Board — open in browser for UI)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{adminUrl}}/admin/queues",
+          "host": ["{{adminUrl}}"],
+          "path": ["admin", "queues"]
+        }
+      }
+    }
+  ]
+}

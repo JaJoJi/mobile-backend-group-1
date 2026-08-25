@@ -1,0 +1,371 @@
+{
+  "info": {
+    "_postman_id": "5433503b-1421-4fa7-96a7-13f94214614e",
+    "name": "Flash Sale API",
+    "description": "Backend API collection for the Flash Sale System. All requests assume the stack is running via `docker compose up`. Requests go through Nginx on `:80` (which load-balances to nest-1/2/3). Bull-Board is exposed directly on `:3001` (nest-1) for admin/debug.\n\nVariables used (set in environment):\n- `{{baseUrl}}` — Nginx API root (default http://localhost:80 → routes to nest-1/2/3)\n- `{{adminUrl}}` — Bull-Board (http://localhost:3001 — direct to nest-1)\n- `{{userId}}` — used by Auth request body (default user-1)\n- `{{productId}}` — used by Orders request body (default p-1001)\n- `{{accessToken}}` — auto-populated by Auth request\n- `{{orderJobId}}` — auto-populated by Order request",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "b5935659-1ba1-47a7-8796-50a8bfdc9753"
+  },
+  "item": [
+    {
+      "name": "01 — Health",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "Returns instance identity. Use to verify the load balancer (later) round-robins across nest-1/2/3."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has instanceId', () => pm.expect(body.instanceId).to.be.a('string').and.not.empty);",
+                  "pm.test('Status is ok', () => pm.expect(body.status).to.eql('ok'));",
+                  "console.log('Instance:', body.instanceId);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "02 — Auth",
+      "item": [
+        {
+          "name": "POST /auth/token — Get JWT",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/token",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "auth", "token"]
+            },
+            "description": "Simulated login. Returns a signed JWT (HS256). Token is auto-saved to `{{accessToken}}` for the Orders folder."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has accessToken', () => pm.expect(body.accessToken).to.be.a('string').and.not.empty);",
+                  "pm.test('Response status is \"success\"', () => pm.expect(body.status).to.eql('success'));",
+                  "pm.environment.set('accessToken', body.accessToken);",
+                  "console.log('JWT saved to env:', body.accessToken.substring(0, 30) + '...');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /auth/token — Invalid (empty userId, expect 400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/token",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "auth", "token"]
+            },
+            "description": "Validation check: empty userId should fail class-validator."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "03 — Products",
+      "item": [
+        {
+          "name": "GET /products — default page",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/products?page=1&limit=10",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "products"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "limit", "value": "10" }
+              ]
+            },
+            "description": "Read-heavy endpoint with Redis cache-aside. First call = MISS (DB hit), second call = HIT (Redis only)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has data array', () => pm.expect(body.data).to.be.an('array'));",
+                  "pm.test('Has meta block', () => pm.expect(body.meta).to.have.property('total'));",
+                  "pm.test('Meta has pagination fields', () => {",
+                  "  pm.expect(body.meta).to.have.property('page');",
+                  "  pm.expect(body.meta).to.have.property('limit');",
+                  "  pm.expect(body.meta).to.have.property('totalPages');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /products?page=1&limit=10 — verify cache HIT",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/products?page=1&limit=10",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "products"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "limit", "value": "10" }
+              ]
+            },
+            "description": "Same params as the previous request — should hit Redis cache. Check `docker compose logs -f nest-1` for [CACHE HIT]."
+          }
+        },
+        {
+          "name": "GET /products — different page (cache MISS)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/products?page=2&limit=5",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "products"],
+              "query": [
+                { "key": "page", "value": "2" },
+                { "key": "limit", "value": "5" }
+              ]
+            },
+            "description": "Different page → different cache key → MISS again."
+          }
+        },
+        {
+          "name": "GET /products — invalid limit (expect 400)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/products?page=1&limit=999",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "products"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "limit", "value": "999" }
+              ]
+            },
+            "description": "Limit must be ≤ 100 (class-validator @Max(100))."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "04 — Orders",
+      "item": [
+        {
+          "name": "POST /orders — place order (expect 202)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"productId\": \"{{productId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "orders"]
+            },
+            "description": "Enqueues an order job. Returns 202 with a jobId. Worker (BullMQ) will atomically decrement stock and insert the order row. Uses {{accessToken}} from Auth folder."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 202 (Accepted)', () => pm.response.to.have.status(202));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has orderJobId', () => pm.expect(body.orderJobId).to.exist);",
+                  "pm.test('Status is \"processing\"', () => pm.expect(body.status).to.eql('processing'));",
+                  "pm.environment.set('orderJobId', body.orderJobId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /orders — duplicate, expect 409 (lock blocks)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"productId\": \"{{productId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "orders"]
+            },
+            "description": "Same userId+productId while the first lock (30s TTL) is still active → 409 Conflict."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 409', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /orders — no auth header (expect 401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"productId\": \"{{productId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "orders"]
+            },
+            "description": "Missing Bearer token → 401 Unauthorized."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /orders — invalid token (expect 401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer not-a-real-jwt" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"productId\": \"{{productId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "orders"]
+            },
+            "description": "Garbage token → 401."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "05 — Bull-Board (observability)",
+      "item": [
+        {
+          "name": "GET {{adminUrl}}/admin/queues",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{adminUrl}}/admin/queues",
+              "host": ["{{adminUrl}}"],
+              "path": ["admin", "queues"]
+            },
+            "description": "Bull-Board dashboard. In Postman this returns HTML; open in a browser for the visual UI."
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost" },
+    { "key": "adminUrl", "value": "http://localhost:3001" }
+  ]
+}

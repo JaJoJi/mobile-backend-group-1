@@ -1,0 +1,119 @@
+### Flash Sale API — VS Code REST Client
+### Install extension: "REST Client" by Huachao Mao
+### Click "Send Request" above each ### to execute
+
+@baseUrl = http://localhost
+@adminUrl = http://localhost:3001
+@userId = user-1
+@productId = p-1001
+@contentType = application/json
+
+### ---------------------------------------------------------------
+### 01 — Health
+### ---------------------------------------------------------------
+
+# @name health
+GET {{baseUrl}}/health
+
+### ---------------------------------------------------------------
+### 02 — Auth — get JWT (response captures {{accessToken}})
+### ---------------------------------------------------------------
+
+# @name auth
+POST {{baseUrl}}/api/v1/auth/token
+Content-Type: {{contentType}}
+
+{
+  "userId": "{{userId}}"
+}
+
+###
+@accessToken = {{auth.response.body.accessToken}}
+
+### ---------------------------------------------------------------
+### 02b — Auth — invalid (empty userId, expect 400)
+### ---------------------------------------------------------------
+
+POST {{baseUrl}}/api/v1/auth/token
+Content-Type: {{contentType}}
+
+{
+  "userId": ""
+}
+
+### ---------------------------------------------------------------
+### 03 — Products — default page
+### ---------------------------------------------------------------
+
+GET {{baseUrl}}/api/v1/products?page=1&limit=10
+
+### ---------------------------------------------------------------
+### 03b — Products — same again (cache HIT)
+### ---------------------------------------------------------------
+
+GET {{baseUrl}}/api/v1/products?page=1&limit=10
+
+### ---------------------------------------------------------------
+### 03c — Products — different page (cache MISS)
+### ---------------------------------------------------------------
+
+GET {{baseUrl}}/api/v1/products?page=2&limit=5
+
+### ---------------------------------------------------------------
+### 03d — Products — invalid limit (expect 400)
+### ---------------------------------------------------------------
+
+GET {{baseUrl}}/api/v1/products?page=1&limit=999
+
+### ---------------------------------------------------------------
+### 04 — Orders — place order (expect 202)
+### ---------------------------------------------------------------
+
+POST {{baseUrl}}/api/v1/orders
+Content-Type: {{contentType}}
+Authorization: Bearer {{accessToken}}
+
+{
+  "productId": "{{productId}}"
+}
+
+### ---------------------------------------------------------------
+### 04b — Orders — duplicate same user (expect 409)
+### ---------------------------------------------------------------
+
+POST {{baseUrl}}/api/v1/orders
+Content-Type: {{contentType}}
+Authorization: Bearer {{accessToken}}
+
+{
+  "productId": "{{productId}}"
+}
+
+### ---------------------------------------------------------------
+### 04c — Orders — no auth header (expect 401)
+### ---------------------------------------------------------------
+
+POST {{baseUrl}}/api/v1/orders
+Content-Type: {{contentType}}
+
+{
+  "productId": "{{productId}}"
+}
+
+### ---------------------------------------------------------------
+### 04d — Orders — invalid token (expect 401)
+### ---------------------------------------------------------------
+
+POST {{baseUrl}}/api/v1/orders
+Content-Type: {{contentType}}
+Authorization: Bearer not-a-real-jwt
+
+{
+  "productId": "{{productId}}"
+}
+
+### ---------------------------------------------------------------
+### 05 — Bull-Board (open in browser for visual UI)
+### ---------------------------------------------------------------
+
+GET {{adminUrl}}/admin/queues

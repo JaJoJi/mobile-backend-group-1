@@ -1,0 +1,124 @@
+services:
+  redis:
+    container_name: redis
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres-primary:
+    image: bitnamilegacy/postgresql:16
+    environment:
+      POSTGRESQL_REPLICATION_MODE: master
+      POSTGRESQL_USERNAME: app
+      POSTGRESQL_PASSWORD: app123
+      POSTGRESQL_DATABASE: flashsale
+      POSTGRESQL_REPLICATION_USER: repl
+      POSTGRESQL_REPLICATION_PASSWORD: repl123
+      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=300"
+    volumes:
+      - pg-primary-data:/bitnami/postgresql
+    ports:
+      - "5432:5432"
+
+  postgres-replica:
+    image: bitnamilegacy/postgresql:16
+    depends_on:
+      - postgres-primary
+    environment:
+      POSTGRESQL_REPLICATION_MODE: slave
+      POSTGRESQL_MASTER_HOST: postgres-primary
+      POSTGRESQL_MASTER_PORT_NUMBER: 5432
+      POSTGRESQL_REPLICATION_USER: repl
+      POSTGRESQL_REPLICATION_PASSWORD: repl123
+      POSTGRESQL_USERNAME: app
+      POSTGRESQL_PASSWORD: app123
+      POSTGRESQL_DATABASE: flashsale
+      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=300"
+    volumes:
+      - pg-replica-data:/bitnami/postgresql
+    ports:
+      - "5433:5432"
+
+  nest-1:
+    container_name: nest-1
+    build: ./flash-sale-backend
+    depends_on:
+      - postgres-primary
+      - postgres-replica
+      - redis
+    env_file: ./flash-sale-backend/.env.docker
+    environment:
+      INSTANCE_ID: nest-1
+    volumes:
+      - ./products-seed.json:/app/products-seed.json:ro
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  nest-2:
+    container_name: nest-2
+    build: ./flash-sale-backend
+    depends_on:
+      - postgres-primary
+      - postgres-replica
+      - redis
+    env_file: ./flash-sale-backend/.env.docker
+    environment:
+      INSTANCE_ID: nest-2
+    volumes:
+      - ./products-seed.json:/app/products-seed.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  nest-3:
+    container_name: nest-3
+    build: ./flash-sale-backend
+    depends_on:
+      - postgres-primary
+      - postgres-replica
+      - redis
+    env_file: ./flash-sale-backend/.env.docker
+    environment:
+      INSTANCE_ID: nest-3
+    volumes:
+      - ./products-seed.json:/app/products-seed.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  nginx:
+    container_name: nginx
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      nest-1:
+        condition: service_healthy
+      nest-2:
+        condition: service_healthy
+      nest-3:
+        condition: service_healthy
+
+volumes:
+  pg-primary-data:
+  pg-replica-data:
