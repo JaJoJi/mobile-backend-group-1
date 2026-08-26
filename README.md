@@ -99,7 +99,7 @@ curl -X POST http://localhost/api/v1/orders `
 bash loadtest/reset.sh
 ```
 
-Both reset `p-1001` stock to 50, clear orders table, and flush Redis counters.
+Both reset **all 20 products** to seed defaults, clear orders table, and flush Redis (uses Node.js for JSON parsing — no `jq` needed).
 
 ### Run the test
 
@@ -118,12 +118,17 @@ k6 run --env BASE_URL=http://localhost `
 | Phase | Duration | VUs | Target |
 |---|---|---|---|
 | Setup | once | — | Fetch 500 unique JWTs (user-1..user-500) |
-| Read | 30s | 1000 | `GET /api/v1/products?page=1&limit=10` |
+| Read | 30s | 1000 | `GET /api/v1/products` with random page/limit + 10% overflow mix |
 | Write | 30s | 500 | `POST /api/v1/orders` for `p-1001`, 2-3 iters per VU |
 
 ### Verify results
 
 ```powershell
+# Quick: run the verify script (recommended)
+bash loadtest/verify.sh        # Bash
+.\loadtest\verify.ps1          # PowerShell
+
+# Manual checks:
 # Cache hit ratio
 curl http://localhost/api/v1/products/admin/cache-stats
 
@@ -137,6 +142,11 @@ docker exec -it $(docker compose ps -q postgres-primary) psql -U app -d flashsal
   "SELECT COUNT(*) AS success, COUNT(DISTINCT \"userId\") AS unique_users `
    FROM orders WHERE \"productId\"='p-1001' AND status='SUCCESS';"
 # Expected: 50 | 50
+
+# Verify no other product was affected (must be 0 rows)
+docker exec -it $(docker compose ps -q postgres-primary) psql -U app -d flashsale -c `
+  "SELECT \"productId\" FROM products WHERE \"productId\" != 'p-1001' AND \"remainingStock\" != \"availableStock\";"
+# Expected: 0 rows
 ```
 
 ---

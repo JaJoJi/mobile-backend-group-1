@@ -1,5 +1,7 @@
 # k6 Load Test — Flash Sale System
 
+Comprehensive coverage: distributed cache keys (with overflow mix), strict p-1001 write target, full data-integrity verification.
+
 ## Install k6
 
 **Windows (chocolatey):**
@@ -19,61 +21,96 @@ echo "deb https://haproxy.org/download/2.4/k6 $(lsb_release -cs) main" | sudo te
 sudo apt-get update && sudo apt-get install k6
 ```
 
+> **Note:** The reset scripts only require **Node.js** (already a project dependency) to parse `products-seed.json`. No `jq` or other JSON tools needed.
+
 ## Files
 
-- `flash-sale.js` — k6 script (3 phases per spec)
-- `reset.sh` — reset DB stock + Redis between runs
+| File | Purpose |
+|---|---|
+| `flash-sale.js` | k6 script — 2 scenarios (read 1,000 VUs + write 500 VUs) |
+| `reset.sh` / `reset.ps1` | Reset all 20 products from `products-seed.json` |
+| `verify.sh` / `verify.ps1` | Post-test SQL + Redis integrity report (console output) |
 
 ## Run the test
 
-```powershell
-# 1. Make sure your stack is up
-cd D:\work\mobile-backend-group-1
+**Bash / WSL / macOS / Linux:**
+```bash
+# 1. Make sure stack is up
+cd mobile-backend-group-1
 docker compose up -d --build
 
-# 2. Wait for stack to be healthy (~10s)
-# 3. Reset DB to known state
+# 2. Reset DB + Redis
 bash loadtest/reset.sh
-# (on Windows + WSL, you may need: wsl bash loadtest/reset.sh)
 
-# 4. Run k6 (goes through Nginx :80 → nest-1/2/3)
+# 3. Run k6 (goes through Nginx :80 → nest-1/2/3)
 k6 run --env BASE_URL=http://localhost loadtest/flash-sale.js
+
+# 4. Verify data integrity + cache state
+bash loadtest/verify.sh
 ```
 
-## Test against a friend's deployment
-
+**PowerShell (Windows-native):**
 ```powershell
-k6 run --env BASE_URL=http://<friend-ip-or-host> loadtest/flash-sale.js
+docker compose up -d --build
+.\loadtest\reset.ps1
+k6 run --env BASE_URL=http://localhost loadtest/flash-sale.js
+.\loadtest\verify.ps1
 ```
 
 ## What the script does
 
-| Phase | Time | VUs | What |
+| Phase | Time | VUs | Target |
 |---|---|---|---|
 | Setup | once | — | Fetch 500 JWTs (user-1 … user-500) |
-| Read | 0–30s | 1000 | GET /api/v1/products?page=1&limit=10 |
-| Write | 35–65s | 500 | POST /api/v1/orders for p-1001, 2-3 iters per VU |
+| Read | 0–30s | 1000 | `GET /api/v1/products` with random page/limit |
+| Write | 35–65s | 500 | `POST /api/v1/orders` for `p-1001`, 2-3 iters/VU |
 
-## Expected output (key metrics)
+## Read scenario — distributed cache key coverage
 
-```
-     ✓ status is 200
-     ✓ has data array
-     ✓ status is 202 or 409
+**Limit options:** `[5, 10, 15, 20, 25, 50]` (6 values, uniformly picked per VU per iteration)
 
-     checks.........................: 100.00% ✓
-     data_received..................: 45 MB
-     data_sent......................: 12 MB
-     http_req_blocked...............: avg=1.2ms    p(95)=5ms
-     http_req_connecting............: avg=800µs    p(95)=3ms
-     http_req_duration..............: avg=120ms    p(95)=280ms
-     http_req_failed................: 5.20%   (409s from duplicate lock)
-     http_reqs......................: 45,231   823.4/s
-     iteration_duration.............: avg=2.3s    p(95)=4.1s
-     vus............................: 500      min=0   max=1000
-```
+**Valid cache keys generated:**
+| Limit | Max Page (20 products) | Cache Keys |
+|---|---|---|
+| 5 | 4 | `page:1..4:limit:5` |
+| 10 | 2 | `page:1..2:limit:10` |
+| 15 | 2 | `page:1..2:limit:15` |
+| 20 | 1 | `page:1:limit:20` (all 20 products) |
+| 25 | 1 | `page:1:limit:25` (capped at 20) |
+| 50 | 1 | `page:1:limit:50` (capped at 20) |
 
-## Save results to JSON
+**Overflow mix (10% of read traffic):**
+- 50% of overflow: `page=5..34` with random limit → returns empty array (200 OK)
+- 50% of overflow: `limit=51..100` (within DTO Max=100) → returns ≤20 rows (200 OK)
+
+**Expected cache key count in Redis:** 11–60 keys (depends on overflow distribution)
+
+## Write scenario — p-1001 only with double/triple click
+
+- Every VU targets `p-1001` exclusively (stock=50)
+- 50% of VUs fire 2 iterations, 50% fire 3 iterations
+- Total requests: ~1,250 (500 VUs × ~2.5 iters)
+- Expected: 50 SUCCESS + ~1,200 HTTP 409 (lock conflict)
+
+## Reset script — all 20 products
+
+Both `reset.sh` and `reset.ps1`:
+1. Read `products-seed.json` (uses Node.js / `ConvertFrom-Json`)
+2. Generate `UPDATE products SET "remainingStock" = CASE "productId" WHEN 'p-1001' THEN 50 ... END`
+3. `TRUNCATE orders`
+4. `FLUSHDB` Redis
+
+## Verify script — console report
+
+`verify.sh` / `verify.ps1` checks 6 categories:
+1. **Stock integrity** — all 20 products, `remainingStock >= 0`
+2. **Non-target products** — 19 non-p-1001 products must be unchanged
+3. **p-1001 target** — `remainingStock=0`, sold=SUCCESS, unique users match
+4. **Order integrity** — no duplicate `(userId, productId)` pairs, stock_sold == SUCCESS_total
+5. **Redis cache state** — hit ratio ≥ 70%, tracked keys count
+6. **Summary** — pass/fail counts
+
+## Save k6 results
 
 ```powershell
 k6 run --env BASE_URL=http://localhost `
@@ -81,13 +118,13 @@ k6 run --env BASE_URL=http://localhost `
      loadtest/flash-sale.js
 ```
 
-(Summaries are also printed to stdout at end of run.)
-
 ## Common issues
 
 | Error | Cause | Fix |
 |---|---|---|
 | `setup failed: cannot fetch JWT` | stack not ready | wait longer after `docker compose up` |
 | `connection refused` | wrong BASE_URL | use `http://localhost` not `https://` |
-| All requests time out | nginx not up | check `docker compose ps` |
-| `products count: 0` after reset | seeder hasn't run yet | wait, then re-run reset |
+| `All requests time out` | nginx not up | check `docker compose ps` |
+| `reset.sh: node: command not found` | Node.js not installed | install Node.js LTS |
+| `verify: cache hit ratio < 70%` | 10% overflow mix pollutes cache | expected — see "WARN" in report |
+| `k6: the body is null so we can't transform it to JSON` | nginx returning 502/504 | check `docker compose ps` and `curl /health/ready` |
