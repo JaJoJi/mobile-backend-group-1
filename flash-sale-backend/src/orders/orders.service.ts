@@ -26,32 +26,27 @@ export class OrdersService {
 
   async create(userId: string, productId: string, traceId?: string) {
     const soldOutKey = this.soldOutKey(productId);
-    const isSoldOut = await this.redis.get<string>(soldOutKey);
+    const purchasedKey = this.purchasedKey(userId, productId);
+    const lockKey = this.lockKey(userId, productId);
+
+    const [isSoldOut, alreadyPurchased] = await Promise.all([
+      this.redis.get<string>(soldOutKey),
+      this.redis.get<string>(purchasedKey),
+    ]);
+
     if (isSoldOut) {
-      this.logger.warn(
-        { userId, productId, traceId },
-        'order rejected: product is sold out',
-      );
       throw new ConflictException({
         status: 'conflict',
         message: 'Product is sold out',
       });
     }
 
-    const purchasedKey = this.purchasedKey(userId, productId);
-    const alreadyPurchased = await this.redis.get<string>(purchasedKey);
     if (alreadyPurchased) {
-      this.logger.warn(
-        { userId, productId, traceId },
-        'order rejected: already purchased',
-      );
       throw new ConflictException({
         status: 'conflict',
         message: 'You have already purchased this product',
       });
     }
-
-    const lockKey = this.lockKey(userId, productId);
 
     const acquired = await this.redis.setNx(
       lockKey,
@@ -60,10 +55,6 @@ export class OrdersService {
     );
 
     if (!acquired) {
-      this.logger.warn(
-        { userId, productId, traceId },
-        'order rejected: lock already held',
-      );
       throw new ConflictException({
         status: 'conflict',
         message: 'You already have an order being processed for this product',
@@ -79,11 +70,6 @@ export class OrdersService {
         removeOnFail: 1000,
         attempts: 1,
       },
-    );
-
-    this.logger.info(
-      { userId, productId, traceId: jobTraceId, jobId: job.id },
-      'order enqueued',
     );
 
     return {

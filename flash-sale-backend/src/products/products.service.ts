@@ -4,7 +4,7 @@ import { Repository } from 'typeorm';
 import { RedisService } from '../cache/redis.service';
 import { Product } from './entities/product.entity';
 
-interface ProductStaticRecord {
+export interface ProductStaticRecord {
   productId: string;
   name: string;
   description: string | null;
@@ -28,6 +28,18 @@ export class ProductsService {
   ) {}
 
   async findAll(page: number, limit: number) {
+    const pageKey = `products:list:page:${page}:limit:${limit}`;
+    const cached = await this.redis.get<{
+      status: string;
+      data: ProductStaticRecord[];
+      meta: { total: number; page: number; limit: number; totalPages: number };
+    }>(pageKey);
+
+    if (cached) {
+      void this.redis.recordFragmentCacheHit();
+      return cached;
+    }
+
     await this.ensureActiveProductIdIndex();
 
     const listKey = 'products:id_list';
@@ -40,7 +52,7 @@ export class ProductsService {
     ]);
 
     if (ids.length === 0) {
-      return {
+      const emptyResult = {
         status: 'success',
         data: [],
         meta: {
@@ -50,6 +62,10 @@ export class ProductsService {
           totalPages: 0,
         },
       };
+      await this.redis.set(pageKey, emptyResult, 60);
+      await this.redis.trackCacheKey(pageKey);
+      void this.redis.recordFragmentCacheMiss();
+      return emptyResult;
     }
 
     const detailKeys = ids.map((id) => this.staticKey(id));
@@ -105,15 +121,12 @@ export class ProductsService {
     }
 
     if (fragmentCacheHit) {
-      await this.redis.recordFragmentCacheHit();
-      this.logger.log(`Cache HIT for page=${page}, limit=${limit}, ids=${ids.length}`);
+      void this.redis.recordFragmentCacheHit();
     } else {
-      await this.redis.recordFragmentCacheMiss();
-      this.logger.warn(`Cache MISS for page=${page}, limit=${limit}, missing=${missingIds.length}`);
+      void this.redis.recordFragmentCacheMiss();
     }
 
     // Data stitching: join the immutable static fragment with the volatile stock fragment
-    // in a single response object. Missing fragments are lazily loaded and cached back to Redis.
     const data = ids
       .map((id) => {
         const product = detailMap.get(id);
@@ -124,9 +137,9 @@ export class ProductsService {
           stock: stockMap.get(id) ?? 0,
         };
       })
-      .filter(Boolean);
+      .filter((p): p is ProductStaticRecord & { stock: number } => p !== null);
 
-    return {
+    const result = {
       status: 'success',
       data,
       meta: {
@@ -136,6 +149,11 @@ export class ProductsService {
         totalPages: Math.max(1, Math.ceil(total / limit)),
       },
     };
+
+    await this.redis.set(pageKey, result, 60);
+    await this.redis.trackCacheKey(pageKey);
+
+    return result;
   }
 
   private async ensureActiveProductIdIndex(): Promise<void> {

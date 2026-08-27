@@ -44,7 +44,7 @@ $CaseStatements = ($Seed | ForEach-Object {
     "WHEN '$($_.productId)' THEN $($_.availableStock)"
 }) -join ' '
 
-$UpdateSql = "UPDATE products SET ""remainingStock"" = CASE ""productId"" $CaseStatements ELSE ""remainingStock"" END, ""availableStock"" = CASE ""productId"" $CaseStatements ELSE ""availableStock"" END;"
+$UpdateSql = "UPDATE products SET ""remainingStock"" = CASE ""productId"" $CaseStatements ELSE ""availableStock"" END, ""availableStock"" = CASE ""productId"" $CaseStatements ELSE ""availableStock"" END;"
 
 Write-Host "-> Updating stock for $($Seed.Count) products..."
 $UpdateSql | & $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
