@@ -8,8 +8,7 @@ $ErrorActionPreference = 'Stop'
 
 $ComposeCmd = $null
 foreach ($candidate in @('docker', 'docker.exe')) {
-    $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
-    if ($cmd -and (& $candidate version 2>&1 | Out-Null)) {
+    if (Get-Command $candidate -ErrorAction SilentlyContinue) {
         $ComposeCmd = $candidate
         break
     }
@@ -45,27 +44,25 @@ $CaseStatements = ($Seed | ForEach-Object {
     "WHEN '$($_.productId)' THEN $($_.availableStock)"
 }) -join ' '
 
-$UpdateSql = "UPDATE products SET `"remainingStock`" = CASE `"productId`" $CaseStatements END;"
+$UpdateSql = "UPDATE products SET ""remainingStock"" = CASE ""productId"" $CaseStatements ELSE ""remainingStock"" END, ""availableStock"" = CASE ""productId"" $CaseStatements ELSE ""availableStock"" END;"
 
 Write-Host "-> Updating stock for $($Seed.Count) products..."
-& $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
-    psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB -c $UpdateSql
+$UpdateSql | & $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
+    psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB
 
 Write-Host "-> Truncating orders table..."
-& $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
-    psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB -c 'TRUNCATE TABLE "orders";'
+'TRUNCATE TABLE "orders";' | & $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
+    psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB
 
 Write-Host "-> Flushing Redis cache + counters..."
 & $ComposeCmd compose exec -T redis redis-cli FLUSHDB | Out-Null
 
 Write-Host "-> Verifying reset..."
-& $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
-    psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB -tA -c `
-    "SELECT `"productId`" || ' | remaining=' || `"remainingStock`" || ' | available=' || `"availableStock`" FROM products ORDER BY `"productId`";"
+'SELECT "productId" || '' | remaining='' || "remainingStock" || '' | available='' || "availableStock" FROM products ORDER BY "productId";' | & $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
+    psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB -tA
 
-& $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
-    psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB -tA -c `
-    "SELECT 'orders count: ' || count(*) FROM orders;"
+'SELECT ''orders count: '' || count(*) FROM orders;' | & $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
+    psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB -tA
 
 Write-Host "Reset complete. Ready for k6 run." -ForegroundColor Green
 Write-Host "  Run: k6 run --env BASE_URL=http://localhost --out json=loadtest\results\summary.json loadtest\flash-sale.js"

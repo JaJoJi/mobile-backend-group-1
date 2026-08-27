@@ -75,9 +75,9 @@ UPDATE_SQL=$("$NODE_CMD" -e "
   process.stdout.write(
     \"UPDATE products SET \\\"remainingStock\\\" = CASE \\\"productId\\\" \" +
     cases +
-    \" END, \\\"availableStock\\\" = CASE \\\"productId\\\" \" +
+    \" ELSE \\\"remainingStock\\\" END, \\\"availableStock\\\" = CASE \\\"productId\\\" \" +
     cases +
-    \" END;\"
+    \" ELSE \\\"availableStock\\\" END;\"
   );
 " < "$SEED_FILE")
 

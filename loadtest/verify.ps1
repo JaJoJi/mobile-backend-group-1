@@ -8,8 +8,7 @@ $ErrorActionPreference = 'Stop'
 
 $ComposeCmd = $null
 foreach ($candidate in @('docker', 'docker.exe')) {
-    $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
-    if ($cmd -and (& $candidate version 2>&1 | Out-Null)) {
+    if (Get-Command $candidate -ErrorAction SilentlyContinue) {
         $ComposeCmd = $candidate
         break
     }
@@ -26,8 +25,8 @@ $env:POSTGRES_DB = if ($env:POSTGRES_DB) { $env:POSTGRES_DB } else { 'flashsale'
 
 function Invoke-Pgsql {
     param([string]$Sql)
-    & $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
-        psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB -tA -c $Sql
+    $Sql | & $ComposeCmd compose exec -T -e "PGPASSWORD=$($env:POSTGRES_PASSWORD)" postgres-primary `
+        psql -h 127.0.0.1 -U $env:POSTGRES_USER -d $env:POSTGRES_DB -tA
 }
 
 function Invoke-Redis {
