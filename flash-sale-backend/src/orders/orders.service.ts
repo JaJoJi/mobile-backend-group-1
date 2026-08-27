@@ -17,9 +17,35 @@ export class OrdersService {
     private readonly redis: RedisService,
     @InjectPinoLogger(OrdersService.name)
     private readonly logger: PinoLogger,
-  ) {}
+  ) { }
 
   async create(userId: string, productId: string, traceId?: string) {
+    const soldOutKey = this.soldOutKey(productId);
+    const isSoldOut = await this.redis.get<string>(soldOutKey);
+    if (isSoldOut) {
+      this.logger.warn(
+        { userId, productId, traceId },
+        'order rejected: product is sold out',
+      );
+      throw new ConflictException({
+        status: 'conflict',
+        message: 'Product is sold out',
+      });
+    }
+
+    const purchasedKey = this.purchasedKey(userId, productId);
+    const alreadyPurchased = await this.redis.get<string>(purchasedKey);
+    if (alreadyPurchased) {
+      this.logger.warn(
+        { userId, productId, traceId },
+        'order rejected: already purchased',
+      );
+      throw new ConflictException({
+        status: 'conflict',
+        message: 'You have already purchased this product',
+      });
+    }
+
     const lockKey = this.lockKey(userId, productId);
 
     const acquired = await this.redis.setNx(
@@ -44,8 +70,8 @@ export class OrdersService {
       'process',
       { userId, productId, traceId: jobTraceId },
       {
-        removeOnComplete: 100,
-        removeOnFail: 100,
+        removeOnComplete: 1000,
+        removeOnFail: 1000,
         attempts: 1,
       },
     );
@@ -65,5 +91,13 @@ export class OrdersService {
 
   lockKey(userId: string, productId: string) {
     return `order:lock:${userId}:${productId}`;
+  }
+
+  purchasedKey(userId: string, productId: string) {
+    return `order:purchased:${userId}:${productId}`;
+  }
+
+  soldOutKey(productId: string) {
+    return `product:soldout:${productId}`;
   }
 }

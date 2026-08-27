@@ -32,6 +32,23 @@ export class OrdersProcessor extends WorkerHost {
 
     this.logger.info(logCtx, 'order job picked up');
 
+    // 1. In-queue duplicate bypass
+    const isPurchased = await this.redis.get<string>(`order:purchased:${userId}:${productId}`);
+    if (isPurchased) {
+      await this.redis.del(lockKey);
+      this.logger.warn({ ...logCtx, reason: 'ALREADY_PURCHASED' }, 'order job skipped: user already purchased');
+      throw new Error('ALREADY_PURCHASED');
+    }
+
+    // 2. In-queue sold-out fast-fail (skip heavy DB UPDATE)
+    const isSoldOut = await this.redis.get<string>(`product:soldout:${productId}`);
+    if (isSoldOut) {
+      await this.recordOrder(userId, productId, 'FAILED', 'OUT_OF_STOCK');
+      await this.redis.del(lockKey);
+      this.logger.warn({ ...logCtx, reason: 'OUT_OF_STOCK_FAST_FAIL' }, 'order job fast-failed: product sold out');
+      throw new Error('OUT_OF_STOCK');
+    }
+
     const updateResult = await this.productRepo
       .createQueryBuilder()
       .update(Product)
@@ -40,6 +57,7 @@ export class OrdersProcessor extends WorkerHost {
       .execute();
 
     if (!updateResult.affected) {
+      await this.redis.set(`product:soldout:${productId}`, '1', 86400);
       await this.recordOrder(userId, productId, 'FAILED', 'OUT_OF_STOCK');
       await this.redis.del(lockKey);
       this.logger.warn({ ...logCtx, reason: 'OUT_OF_STOCK' }, 'order rejected: out of stock');
@@ -48,6 +66,7 @@ export class OrdersProcessor extends WorkerHost {
 
     try {
       await this.recordOrder(userId, productId, 'SUCCESS');
+      await this.redis.set(`order:purchased:${userId}:${productId}`, '1', 86400);
     } catch (err) {
       await this.productRepo.increment({ productId }, 'remainingStock', 1);
       await this.redis.del(lockKey);
