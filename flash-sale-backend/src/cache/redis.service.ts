@@ -12,12 +12,45 @@ export class RedisService {
   }
 
   async set(key: string, value: unknown, ttlSeconds?: number): Promise<void> {
-    const payload = JSON.stringify(value);
+    const payload = this.serialize(value);
     if (ttlSeconds) {
       await this.client.set(key, payload, 'EX', ttlSeconds);
     } else {
       await this.client.set(key, payload);
     }
+  }
+
+  async mset(entries: Array<{ key: string; value: unknown; ttlSeconds?: number }>): Promise<void> {
+    if (entries.length === 0) return;
+
+    const pipeline = this.client.pipeline();
+    for (const entry of entries) {
+      const payload = this.serialize(entry.value);
+      if (entry.ttlSeconds) {
+        pipeline.set(entry.key, payload, 'EX', entry.ttlSeconds);
+      } else {
+        pipeline.set(entry.key, payload);
+      }
+    }
+
+    await pipeline.exec();
+  }
+
+  async mgetStrings(keys: string[]): Promise<Array<string | null>> {
+    if (keys.length === 0) return [];
+    return this.client.mget(...keys);
+  }
+
+  async lrange(key: string, start: number, stop: number): Promise<string[]> {
+    return this.client.lrange(key, start, stop);
+  }
+
+  async rpush(key: string, ...values: string[]): Promise<number> {
+    return this.client.rpush(key, ...values);
+  }
+
+  async llen(key: string): Promise<number> {
+    return this.client.llen(key);
   }
 
   async del(...keys: string[]): Promise<number> {
@@ -26,7 +59,13 @@ export class RedisService {
   }
 
   async setNx(key: string, value: unknown, ttlSeconds: number): Promise<boolean> {
-    const result = await this.client.set(key, JSON.stringify(value), 'EX', ttlSeconds, 'NX');
+    const result = await this.client.set(
+      key,
+      this.serialize(value),
+      'EX',
+      ttlSeconds,
+      'NX',
+    );
     return result === 'OK';
   }
 
@@ -51,11 +90,22 @@ export class RedisService {
   }
 
   async incrCacheHit(): Promise<number> {
+    // Atomic Redis counter: safe across tens of thousands of concurrent requests.
     return this.client.incr('cache:hits:products');
   }
 
   async incrCacheMiss(): Promise<number> {
+    // Atomic Redis counter: a cache miss is counted once per request that missed
+    // the fragment layer and had to fall back to PostgreSQL.
     return this.client.incr('cache:misses:products');
+  }
+
+  async recordFragmentCacheHit(): Promise<number> {
+    return this.incrCacheHit();
+  }
+
+  async recordFragmentCacheMiss(): Promise<number> {
+    return this.incrCacheMiss();
   }
 
   async getCacheStats(): Promise<{
@@ -79,7 +129,30 @@ export class RedisService {
     };
   }
 
+  async safeDecrIfExists(key: string): Promise<{ changed: boolean; value: number }> {
+    // Safe DECR: only decrement if the key already exists. This avoids a thundering herd
+    // race where a cold cache miss creates a missing stock key that is then decremented by mistake.
+    const script = `
+      if redis.call('EXISTS', KEYS[1]) == 1 then
+        return redis.call('DECR', KEYS[1])
+      end
+      return 0
+    `;
+
+    const result = await this.client.eval(script, 1, key);
+    const value = Number(result ?? 0);
+    return {
+      changed: value !== 0,
+      value,
+    };
+  }
+
   raw(): Redis {
     return this.client;
+  }
+
+  private serialize(value: unknown): string {
+    if (typeof value === 'string') return value;
+    return JSON.stringify(value);
   }
 }
