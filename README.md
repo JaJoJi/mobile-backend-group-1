@@ -147,6 +147,10 @@ docker exec -it $(docker compose ps -q postgres-primary) psql -U app -d flashsal
 docker exec -it $(docker compose ps -q postgres-primary) psql -U app -d flashsale -c `
   "SELECT \"productId\" FROM products WHERE \"productId\" != 'p-1001' AND \"remainingStock\" != \"availableStock\";"
 # Expected: 0 rows
+
+# Query orders via REST API (no auth) — sorted by createdAt ASC
+curl "http://localhost/api/v1/orders?productId=p-1001&status=SUCCESS&page=1&limit=50"
+# Expected: { "status":"success", "data":[{...}], "meta":{"total":50,"page":1,...} }
 ```
 
 ---
@@ -260,7 +264,7 @@ mobile-backend-group-1/
 │       ├── common/                    # guards + decorators
 │       ├── database/                  # TypeORM config + migrations
 │       ├── health/                    # /health/live + /health/ready
-│       ├── orders/                    # POST /api/v1/orders + BullMQ processor
+│       ├── orders/                    # POST /api/v1/orders + GET list + BullMQ processor
 │       ├── products/                  # GET /api/v1/products + cache
 │       └── queue/                     # BullMQ module
 │
@@ -326,6 +330,7 @@ JWT_EXPIRES_IN=1h
 | `/api/v1/products` | GET | — | List products (paginated, cached) |
 | `/api/v1/products/admin/cache-stats` | GET | — | Cache hit/miss counters |
 | `/api/v1/orders` | POST | JWT | Place order — body `{productId}` |
+| `/api/v1/orders` | GET | — | List orders (paginated, sorted by `createdAt` ASC); filters: `productId`, `userId`, `status` |
 | `/admin/queues` | GET (HTML) | — | Bull-Board dashboard (port 3001) |
 
 For full request/response shapes and example values, see [postman/flash-sale.postman_collection.json](postman/flash-sale.postman_collection.json).

@@ -33,6 +33,11 @@ if (-not (Test-Path $SeedFile)) {
 
 $Seed = Get-Content $SeedFile -Raw | ConvertFrom-Json
 
+$ResultsDir = Join-Path $PSScriptRoot 'results'
+if (-not (Test-Path $ResultsDir)) {
+    New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
+}
+
 Write-Host "Using: $ComposeCmd compose"
 Write-Host "Resetting all $($Seed.Count) products from products-seed.json..."
 
@@ -63,5 +68,5 @@ Write-Host "-> Verifying reset..."
     "SELECT 'orders count: ' || count(*) FROM orders;"
 
 Write-Host "Reset complete. Ready for k6 run." -ForegroundColor Green
-Write-Host "  Run: k6 run --env BASE_URL=http://localhost loadtest/flash-sale.js"
+Write-Host "  Run: k6 run --env BASE_URL=http://localhost --out json=loadtest\results\summary.json loadtest\flash-sale.js"
 Write-Host "  Then: .\loadtest\verify.ps1"

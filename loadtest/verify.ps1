@@ -134,6 +134,13 @@ if ($UniqueUsers -eq $SuccessP1001) {
     Check-Fail "Duplicate orders detected: SUCCESS=$SuccessP1001 but unique users=$UniqueUsers"
 }
 
+$ExpectedP1001 = 50
+if ($SuccessP1001 -eq "$ExpectedP1001") {
+    Check-Pass "Exactly $ExpectedP1001 SUCCESS orders for p-1001 (matches stock)"
+} else {
+    Check-Fail "Expected $ExpectedP1001 SUCCESS orders for p-1001, got $SuccessP1001"
+}
+
 # 4. Order integrity global
 Print-Header '4. Order Integrity - Global'
 

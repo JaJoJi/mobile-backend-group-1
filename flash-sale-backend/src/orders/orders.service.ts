@@ -3,10 +3,14 @@ import {
   Injectable,
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
+import { InjectRepository } from '@nestjs/typeorm';
 import type { Queue } from 'bullmq';
+import { Repository } from 'typeorm';
 import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
 import { randomUUID } from 'crypto';
 import { RedisService } from '../cache/redis.service';
+import { Order } from './entities/order.entity';
+import { QueryOrdersDto } from './dto/query-orders.dto';
 
 @Injectable()
 export class OrdersService {
@@ -14,6 +18,7 @@ export class OrdersService {
 
   constructor(
     @InjectQueue('orders') private readonly ordersQueue: Queue,
+    @InjectRepository(Order) private readonly orderRepo: Repository<Order>,
     private readonly redis: RedisService,
     @InjectPinoLogger(OrdersService.name)
     private readonly logger: PinoLogger,
@@ -60,6 +65,33 @@ export class OrdersService {
       orderJobId: String(job.id),
       message: 'Your order is in the queue.',
       traceId: jobTraceId,
+    };
+  }
+
+  async findAll(query: QueryOrdersDto) {
+    const { page, limit, productId, userId, status } = query;
+
+    const where: Record<string, unknown> = {};
+    if (productId) where.productId = productId;
+    if (userId) where.userId = userId;
+    if (status) where.status = status;
+
+    const [data, total] = await this.orderRepo.findAndCount({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      order: { createdAt: 'ASC' },
+    });
+
+    return {
+      status: 'success',
+      data,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+      },
     };
   }
 

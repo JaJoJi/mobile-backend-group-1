@@ -13,7 +13,7 @@ interface OrderJobData {
   traceId?: string;
 }
 
-@Processor('orders', { concurrency: 5 })
+@Processor('orders', { concurrency: 10 })
 export class OrdersProcessor extends WorkerHost {
   constructor(
     @InjectRepository(Product) private readonly productRepo: Repository<Product>,

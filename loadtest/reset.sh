@@ -59,6 +59,8 @@ PSQL_CMD=(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SEED_FILE="$SCRIPT_DIR/../products-seed.json"
 
+mkdir -p "$SCRIPT_DIR/results"
+
 if [ ! -f "$SEED_FILE" ]; then
   echo "ERROR: $SEED_FILE not found." >&2
   exit 1
@@ -106,5 +108,5 @@ echo "-> Verifying reset..."
   "SELECT 'orders count: ' || count(*) FROM orders;"
 
 echo "Reset complete. Ready for k6 run."
-echo "  Run: k6 run --env BASE_URL=http://localhost loadtest/flash-sale.js"
+echo "  Run: k6 run --env BASE_URL=http://localhost --out json=loadtest/results/summary.json loadtest/flash-sale.js"
 echo "  Then: bash loadtest/verify.sh"

@@ -141,6 +141,13 @@ else
   check_fail "Duplicate orders detected: SUCCESS=$SUCCESS_P1001 but unique users=$UNIQUE_USERS"
 fi
 
+EXPECTED_P1001=50
+if [ "$SUCCESS_P1001" = "$EXPECTED_P1001" ]; then
+  check_pass "Exactly $EXPECTED_P1001 SUCCESS orders for p-1001 (matches stock)"
+else
+  check_fail "Expected $EXPECTED_P1001 SUCCESS orders for p-1001, got $SUCCESS_P1001"
+fi
+
 print_header "4. Order Integrity — Global"
 
 TOTAL_ORDERS=$("${PSQL_CMD[@]}" -tA -c "SELECT COUNT(*) FROM orders;")

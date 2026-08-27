@@ -39,11 +39,13 @@ sudo apt-get update && sudo apt-get install k6
 cd mobile-backend-group-1
 docker compose up -d --build
 
-# 2. Reset DB + Redis
+# 2. Reset DB + Redis (also creates loadtest/results/)
 bash loadtest/reset.sh
 
 # 3. Run k6 (goes through Nginx :80 → nest-1/2/3)
-k6 run --env BASE_URL=http://localhost loadtest/flash-sale.js
+k6 run --env BASE_URL=http://localhost \
+       --out json=loadtest/results/summary.json \
+       loadtest/flash-sale.js
 
 # 4. Verify data integrity + cache state
 bash loadtest/verify.sh
@@ -53,7 +55,9 @@ bash loadtest/verify.sh
 ```powershell
 docker compose up -d --build
 .\loadtest\reset.ps1
-k6 run --env BASE_URL=http://localhost loadtest/flash-sale.js
+k6 run --env BASE_URL=http://localhost `
+       --out json=loadtest\results\summary.json `
+       loadtest\flash-sale.js
 .\loadtest\verify.ps1
 ```
 
@@ -91,6 +95,43 @@ k6 run --env BASE_URL=http://localhost loadtest/flash-sale.js
 - 50% of VUs fire 2 iterations, 50% fire 3 iterations
 - Total requests: ~1,250 (500 VUs × ~2.5 iters)
 - Expected: 50 SUCCESS + ~1,200 HTTP 409 (lock conflict)
+
+## Pass / fail semantics
+
+| Layer | Counts as pass | Counts as fail (test exits non-zero) |
+|---|---|---|
+| HTTP | `200` (read), `202` / `409` (write) | Any `4xx` other than `409`, any `5xx`, timeout > 10 s, connection refused, DNS/TLS error |
+| Business | `202` = order accepted, `409` = stock exhausted / duplicate / lock conflict | — (no business-level "fail" — all are valid outcomes) |
+
+Thresholds that gate the test (uses a **custom** `http_infra_failures` metric — k6's built-in `http_req_failed` counts every 4xx as failure, including our expected `409`):
+
+```
+http_infra_failures rate                    < 1%    (5xx + timeout + non-409 4xx)
+http_infra_failures{scenario:read_load}     < 1%
+http_infra_failures{scenario:write_load}    < 1%
+checks rate                                 > 99%   (every check() must pass)
+checks{scenario:read_load}                  > 99%
+checks{scenario:write_load}                 > 99%
+http_req_duration p(95)                     < 500 ms (per scenario too)
+```
+
+Per-request timeout is **10 s** (`REQ_PARAMS.timeout`).
+
+## Custom summary output
+
+`handleSummary` auto-creates `loadtest/results/`, prints a banner + writes `loadtest/results/summary.json`:
+
+```
+============================================================
+  FLASH SALE LOAD TEST — BUSINESS SUMMARY
+============================================================
+  orders accepted (HTTP 202) .........: 50
+  orders conflicted (HTTP 409) .......: 1182
+  infra failure rate (5xx/timeout/4xx): 0.00%
+============================================================
+```
+
+Counters / rates emitted: `order_accepted_total`, `order_conflicted_total`, `http_infra_failures`.
 
 ## Reset script — all 20 products
 
