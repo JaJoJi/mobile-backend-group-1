@@ -28,6 +28,8 @@ export class ProductsService {
   ) {}
 
   async findAll(page: number, limit: number) {
+    await this.ensureActiveProductIdIndex();
+
     const listKey = 'products:id_list';
     const start = (page - 1) * limit;
     const stop = start + limit - 1;
@@ -60,17 +62,22 @@ export class ProductsService {
 
     const detailMap = new Map<string, ProductStaticRecord>();
     const stockMap = new Map<string, number>();
+    let fragmentCacheHit = true;
 
     for (const [index, id] of ids.entries()) {
       const detailValue = detailValues[index];
       const parsedDetail = detailValue ? this.parseJson<ProductStaticRecord>(detailValue) : null;
       if (parsedDetail) {
         detailMap.set(id, parsedDetail);
+      } else {
+        fragmentCacheHit = false;
       }
 
       const stockValue = stockValues[index];
       if (stockValue != null) {
         stockMap.set(id, Number(stockValue));
+      } else {
+        fragmentCacheHit = false;
       }
     }
 
@@ -81,6 +88,7 @@ export class ProductsService {
     ).sort();
 
     if (missingIds.length > 0) {
+      fragmentCacheHit = false;
       const missingProducts = await this.loadMissingProducts(missingIds);
 
       for (const id of missingIds) {
@@ -94,6 +102,14 @@ export class ProductsService {
           stockMap.set(id, stock);
         }
       }
+    }
+
+    if (fragmentCacheHit) {
+      await this.redis.recordFragmentCacheHit();
+      this.logger.log(`Cache HIT for page=${page}, limit=${limit}, ids=${ids.length}`);
+    } else {
+      await this.redis.recordFragmentCacheMiss();
+      this.logger.warn(`Cache MISS for page=${page}, limit=${limit}, missing=${missingIds.length}`);
     }
 
     // Data stitching: join the immutable static fragment with the volatile stock fragment
@@ -120,6 +136,34 @@ export class ProductsService {
         totalPages: Math.max(1, Math.ceil(total / limit)),
       },
     };
+  }
+
+  private async ensureActiveProductIdIndex(): Promise<void> {
+    const listKey = 'products:id_list';
+    const currentCount = await this.redis.llen(listKey);
+
+    if (currentCount > 0) {
+      return;
+    }
+
+    this.logger.warn(
+      `Index cache missing or empty (${listKey}); rebuilding from PostgreSQL for flash-sale products`,
+    );
+
+    const rows = await this.repo
+      .createQueryBuilder('product')
+      .select('product."productId"', 'productId')
+      .where('product."isFlashSaleActive" = :active', { active: true })
+      .orderBy('product."productId"', 'ASC')
+      .getRawMany<{ productId: string }>();
+
+    if (rows.length === 0) {
+      return;
+    }
+
+    await this.redis.rpush(listKey, ...rows.map((row) => row.productId));
+    await this.redis.recordFragmentCacheMiss();
+    this.logger.log(`Rebuilt ${listKey} with ${rows.length} IDs after cache flush`);
   }
 
   private staticKey(id: string): string {

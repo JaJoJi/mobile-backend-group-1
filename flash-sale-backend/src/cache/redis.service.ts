@@ -90,11 +90,22 @@ export class RedisService {
   }
 
   async incrCacheHit(): Promise<number> {
+    // Atomic Redis counter: safe across tens of thousands of concurrent requests.
     return this.client.incr('cache:hits:products');
   }
 
   async incrCacheMiss(): Promise<number> {
+    // Atomic Redis counter: a cache miss is counted once per request that missed
+    // the fragment layer and had to fall back to PostgreSQL.
     return this.client.incr('cache:misses:products');
+  }
+
+  async recordFragmentCacheHit(): Promise<number> {
+    return this.incrCacheHit();
+  }
+
+  async recordFragmentCacheMiss(): Promise<number> {
+    return this.incrCacheMiss();
   }
 
   async getCacheStats(): Promise<{
