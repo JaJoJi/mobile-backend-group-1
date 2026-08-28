@@ -61,23 +61,47 @@ export class OrdersService {
       });
     }
 
-    const jobTraceId = traceId ?? randomUUID();
-    const job = await this.ordersQueue.add(
-      'process',
-      { userId, productId, traceId: jobTraceId },
-      {
-        removeOnComplete: 1000,
-        removeOnFail: 1000,
-        attempts: 1,
-      },
-    );
+    const stockKey = `stock:${productId}`;
+    const remainingStock = await this.redis.raw().decr(stockKey);
 
-    return {
-      status: 'processing',
-      orderJobId: String(job.id),
-      message: 'Your order is in the queue.',
-      traceId: jobTraceId,
-    };
+    if (remainingStock < 0) {
+      await this.redis.raw().incr(stockKey);
+      await this.redis.set(soldOutKey, '1', 86400);
+      await this.redis.del(lockKey);
+      throw new ConflictException({
+        status: 'conflict',
+        message: 'Product is sold out',
+      });
+    }
+
+    if (remainingStock === 0) {
+      await this.redis.set(soldOutKey, '1', 86400);
+    }
+
+    const jobTraceId = traceId ?? randomUUID();
+
+    try {
+      const job = await this.ordersQueue.add(
+        'process',
+        { userId, productId, traceId: jobTraceId },
+        {
+          removeOnComplete: 1000,
+          removeOnFail: 1000,
+          attempts: 1,
+        },
+      );
+
+      return {
+        status: 'processing',
+        orderJobId: String(job.id),
+        message: 'Your order is in the queue.',
+        traceId: jobTraceId,
+      };
+    } catch (error) {
+      await this.redis.raw().incr(stockKey);
+      await this.redis.del(lockKey);
+      throw error;
+    }
   }
 
   async findAll(query: QueryOrdersDto) {

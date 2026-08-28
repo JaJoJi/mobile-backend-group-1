@@ -95,17 +95,22 @@ export class RedisService {
   }
 
   async incrCacheMiss(): Promise<number> {
-    // Atomic Redis counter: a cache miss is counted once per request that missed
-    // the fragment layer and had to fall back to PostgreSQL.
     return this.client.incr('cache:misses:products');
+  }
+
+  // Atomically increment the miss counter by an arbitrary count. Used so a single
+  // cold-start batch fallback registers one miss per distinct missing product,
+  // rather than one miss per request.
+  async incrCacheMissBy(count: number): Promise<number> {
+    return this.client.incrby('cache:misses:products', count);
   }
 
   async recordFragmentCacheHit(): Promise<number> {
     return this.incrCacheHit();
   }
 
-  async recordFragmentCacheMiss(): Promise<number> {
-    return this.incrCacheMiss();
+  async recordFragmentCacheMiss(count = 1): Promise<number> {
+    return this.incrCacheMissBy(count);
   }
 
   async getCacheStats(): Promise<{

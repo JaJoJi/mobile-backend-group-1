@@ -2,7 +2,7 @@ import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
 import type { Job } from 'bullmq';
-import { Repository } from 'typeorm';
+import { QueryFailedError, Repository } from 'typeorm';
 import { RedisService } from '../cache/redis.service';
 import { Product } from '../products/entities/product.entity';
 import { Order } from './entities/order.entity';
@@ -32,21 +32,13 @@ export class OrdersProcessor extends WorkerHost {
 
     this.logger.info(logCtx, 'order job picked up');
 
-    // 1. In-queue duplicate bypass
+    // The producer already reserved Redis stock before enqueueing this job.
+    // The worker only persists the order and records the purchased marker.
     const isPurchased = await this.redis.get<string>(`order:purchased:${userId}:${productId}`);
     if (isPurchased) {
       await this.redis.del(lockKey);
       this.logger.warn({ ...logCtx, reason: 'ALREADY_PURCHASED' }, 'order job skipped: user already purchased');
       throw new Error('ALREADY_PURCHASED');
-    }
-
-    // 2. In-queue sold-out fast-fail (skip heavy DB UPDATE)
-    const isSoldOut = await this.redis.get<string>(`product:soldout:${productId}`);
-    if (isSoldOut) {
-      await this.recordOrder(userId, productId, 'FAILED', 'OUT_OF_STOCK');
-      await this.redis.del(lockKey);
-      this.logger.warn({ ...logCtx, reason: 'OUT_OF_STOCK_FAST_FAIL' }, 'order job fast-failed: product sold out');
-      throw new Error('OUT_OF_STOCK');
     }
 
     const updateResult = await this.productRepo
@@ -57,7 +49,6 @@ export class OrdersProcessor extends WorkerHost {
       .execute();
 
     if (!updateResult.affected) {
-      await this.redis.set(`product:soldout:${productId}`, '1', 86400);
       await this.recordOrder(userId, productId, 'FAILED', 'OUT_OF_STOCK');
       await this.redis.del(lockKey);
       this.logger.warn({ ...logCtx, reason: 'OUT_OF_STOCK' }, 'order rejected: out of stock');
@@ -68,12 +59,27 @@ export class OrdersProcessor extends WorkerHost {
       await this.recordOrder(userId, productId, 'SUCCESS');
       await this.redis.set(`order:purchased:${userId}:${productId}`, '1', 86400);
     } catch (err) {
-      await this.productRepo.increment({ productId }, 'remainingStock', 1);
+      const isUniqueViolation =
+        err instanceof QueryFailedError &&
+        (err as QueryFailedError & { code?: string }).code === '23505';
+
+      if (isUniqueViolation) {
+        // Only a genuine unique-constraint violation signals a duplicate purchase.
+        await this.productRepo.increment({ productId }, 'remainingStock', 1);
+        this.logger.warn(
+          { ...logCtx, reason: 'DUPLICATE_USER_PRODUCT' },
+          'order rejected: duplicate (unique constraint)',
+        );
+      } else {
+        // Transient DB outages, pool exhaustion, or timeouts must surface as a real
+        // job failure rather than being relabeled as a duplicate purchase.
+        this.logger.error(
+          { ...logCtx, err },
+          'order persistence failed',
+        );
+      }
+
       await this.redis.del(lockKey);
-      this.logger.warn(
-        { ...logCtx, reason: 'DUPLICATE_USER_PRODUCT' },
-        'order rejected: duplicate (unique constraint)',
-      );
       throw err;
     }
 

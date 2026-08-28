@@ -7,7 +7,6 @@ import { Product } from '../products/entities/product.entity';
 import { OrdersController } from './orders.controller';
 import { OrdersService } from './orders.service';
 import { OrdersProcessor } from './orders.processor';
-import { OrderProcessorService } from './order-processor.service';
 
 @Module({
   imports: [
@@ -16,7 +15,6 @@ import { OrderProcessorService } from './order-processor.service';
     AuthModule,
   ],
   controllers: [OrdersController],
-  providers: [OrdersService, OrdersProcessor, OrderProcessorService],
-  exports: [OrderProcessorService],
+  providers: [OrdersService, OrdersProcessor],
 })
 export class OrdersModule {}

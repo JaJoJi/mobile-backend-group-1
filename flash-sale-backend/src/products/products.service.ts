@@ -1,6 +1,7 @@
 import { Injectable, Logger as NestLogger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { randomUUID } from 'crypto';
 import { RedisService } from '../cache/redis.service';
 import { Product } from './entities/product.entity';
 
@@ -15,12 +16,17 @@ export interface ProductStaticRecord {
 
 @Injectable()
 export class ProductsService {
+  private static readonly INDEX_KEY = 'products:id_list';
+  private static readonly INDEX_REBUILD_LOCK_KEY = 'products:id_list:rebuild_lock';
+  private static readonly INDEX_REBUILD_LOCK_TTL_SECONDS = 10;
+
   private readonly logger = new NestLogger(ProductsService.name);
 
   // Promise memoization / request deduplication:
   // when 10,000 requests hit the same cold cache window, only the first request creates the DB lookup.
   // Every other request reuses the same Promise until the load completes.
   private readonly inFlightLoads = new Map<string, Promise<Record<string, ProductStaticRecord>>>();
+  private indexRebuildPromise?: Promise<void>;
 
   constructor(
     @InjectRepository(Product) private readonly repo: Repository<Product>,
@@ -28,18 +34,6 @@ export class ProductsService {
   ) {}
 
   async findAll(page: number, limit: number) {
-    const pageKey = `products:list:page:${page}:limit:${limit}`;
-    const cached = await this.redis.get<{
-      status: string;
-      data: ProductStaticRecord[];
-      meta: { total: number; page: number; limit: number; totalPages: number };
-    }>(pageKey);
-
-    if (cached) {
-      void this.redis.recordFragmentCacheHit();
-      return cached;
-    }
-
     await this.ensureActiveProductIdIndex();
 
     const listKey = 'products:id_list';
@@ -62,9 +56,6 @@ export class ProductsService {
           totalPages: 0,
         },
       };
-      await this.redis.set(pageKey, emptyResult, 60);
-      await this.redis.trackCacheKey(pageKey);
-      void this.redis.recordFragmentCacheMiss();
       return emptyResult;
     }
 
@@ -121,10 +112,12 @@ export class ProductsService {
     }
 
     if (fragmentCacheHit) {
-      void this.redis.recordFragmentCacheHit();
-    } else {
-      void this.redis.recordFragmentCacheMiss();
+      await this.redis.recordFragmentCacheHit();
     }
+    // Note: cache misses are NOT counted here. Miss counting lives inside
+    // fetchMissingProductsFromDb() so it reflects each distinct product that was
+    // actually loaded from PostgreSQL, independent of request batching and
+    // single-flight deduplication.
 
     // Data stitching: join the immutable static fragment with the volatile stock fragment
     const data = ids
@@ -150,38 +143,85 @@ export class ProductsService {
       },
     };
 
-    await this.redis.set(pageKey, result, 60);
-    await this.redis.trackCacheKey(pageKey);
 
     return result;
   }
 
   private async ensureActiveProductIdIndex(): Promise<void> {
-    const listKey = 'products:id_list';
+    const listKey = ProductsService.INDEX_KEY;
     const currentCount = await this.redis.llen(listKey);
 
     if (currentCount > 0) {
       return;
     }
 
-    this.logger.warn(
-      `Index cache missing or empty (${listKey}); rebuilding from PostgreSQL for flash-sale products`,
-    );
-
-    const rows = await this.repo
-      .createQueryBuilder('product')
-      .select('product."productId"', 'productId')
-      .where('product."isFlashSaleActive" = :active', { active: true })
-      .orderBy('product."productId"', 'ASC')
-      .getRawMany<{ productId: string }>();
-
-    if (rows.length === 0) {
-      return;
+    if (this.indexRebuildPromise) {
+      return this.indexRebuildPromise;
     }
 
-    await this.redis.rpush(listKey, ...rows.map((row) => row.productId));
-    await this.redis.recordFragmentCacheMiss();
-    this.logger.log(`Rebuilt ${listKey} with ${rows.length} IDs after cache flush`);
+    this.indexRebuildPromise = this.rebuildActiveProductIdIndex().finally(() => {
+      this.indexRebuildPromise = undefined;
+    });
+
+    return this.indexRebuildPromise;
+  }
+
+  private async rebuildActiveProductIdIndex(): Promise<void> {
+    const listKey = ProductsService.INDEX_KEY;
+    const lockKey = ProductsService.INDEX_REBUILD_LOCK_KEY;
+    const lockToken = randomUUID();
+
+    const acquired = await this.redis.setNx(
+      lockKey,
+      lockToken,
+      ProductsService.INDEX_REBUILD_LOCK_TTL_SECONDS,
+    );
+
+    if (!acquired) {
+      // Another API instance owns the rebuild. Wait for its list write instead of
+      // issuing a competing PostgreSQL query during a cold start.
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        if ((await this.redis.llen(listKey)) > 0) {
+          return;
+        }
+      }
+
+      // Recover if the owner failed before publishing the list or its lock expired.
+      return this.ensureActiveProductIdIndex();
+    }
+
+    try {
+      if ((await this.redis.llen(listKey)) > 0) {
+        return;
+      }
+
+      this.logger.warn(
+        `Index cache missing or empty (${listKey}); rebuilding from PostgreSQL for flash-sale products`,
+      );
+
+      const rows = await this.repo
+        .createQueryBuilder('product')
+        .select('product."productId"', 'productId')
+        .where('product."isFlashSaleActive" = :active', { active: true })
+        .orderBy('product."productId"', 'ASC')
+        .getRawMany<{ productId: string }>();
+
+      if (rows.length === 0) {
+        return;
+      }
+
+      await this.redis.rpush(listKey, ...rows.map((row) => row.productId));
+      await this.redis.raw().expire(listKey, 60 * 60);
+      this.logger.log(`Rebuilt ${listKey} with ${rows.length} IDs after cache flush`);
+    } finally {
+      await this.redis.raw().eval(
+        `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end`,
+        1,
+        lockKey,
+        lockToken,
+      );
+    }
   }
 
   private staticKey(id: string): string {
@@ -255,6 +295,12 @@ export class ProductsService {
     const byId: Record<string, ProductStaticRecord> = {};
     const writeBack: Array<{ key: string; value: unknown; ttlSeconds?: number }> = [];
 
+    // Count a miss for each distinct product that was actually fetched here.
+    // Because loadMissingProducts() single-flights concurrent requests onto one
+    // promise, this runs exactly once per cold-start batch and accurately reflects
+    // the distinct DB fallback reads (e.g. 11 misses for 11 missing products).
+    await this.redis.recordFragmentCacheMiss(rows.length);
+
     for (const row of rows) {
       const staticRecord: ProductStaticRecord = {
         productId: row.productId,
@@ -269,13 +315,13 @@ export class ProductsService {
       writeBack.push({
         key: this.staticKey(row.productId),
         value: staticRecord,
-        ttlSeconds: 60 * 60,
+        ttlSeconds: 24 * 60 * 60,
       });
 
       writeBack.push({
         key: this.stockKey(row.productId),
         value: Number(row.remainingStock ?? row.availableStock ?? 0),
-        ttlSeconds: 60,
+        ttlSeconds: 24 * 60 * 60,
       });
     }
 
