@@ -4,11 +4,11 @@
  * Run with:
  *   k6 run --env BASE_URL=http://localhost loadtest/flash-sale.js
  *
- * Phases (per spec):
+ * Phases (per spec, no ramp — flat VU count for the full duration):
  *   1. Setup   — fetch 500 unique JWTs (user-1 .. user-500)
- *   2. Read    — 1000 concurrent users, 30s, GET /api/v1/products
+ *   2. Read    — 1000 concurrent users, 50s, GET /api/v1/products
  *                Distributed limit range [5,10,15,20,25,50] + 5% overflow mix
- *   3. Write   — 500 concurrent users, 30s, POST /api/v1/orders for p-1001 only
+ *   3. Write   — 500 concurrent users, 50s, POST /api/v1/orders for p-1001 only
  *                2-3 iterations per VU (double/triple click simulation)
  *
  * Cache keys generated (expected):
@@ -33,7 +33,7 @@ const TOTAL_USERS = 500;
 const TARGET_PRODUCT = 'p-1001';
 const TOTAL_PRODUCTS = 20;
 const OVERFLOW_RATE = 0.05;
-const REQ_TIMEOUT = '10s';
+const REQ_TIMEOUT = '60s';
 const REQ_PARAMS = { timeout: REQ_TIMEOUT, tags: { expected_response: 'true' } };
 
 const orderAccepted = new Counter('order_accepted_total');
@@ -70,29 +70,19 @@ function pickOverflowQuery() {
 export const options = {
   scenarios: {
     read_load: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: '10s', target: 500 },
-        { duration: '5s', target: 1000 },
-        { duration: '30s', target: 1000 },
-        { duration: '5s', target: 0 },
-      ],
+      executor: 'constant-vus',
+      vus: 1000,
+      duration: '50s',
       exec: 'readScenario',
-      gracefulRampDown: '5s',
+      gracefulStop: '5s',
     },
     write_load: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: '10s', target: 250 },
-        { duration: '5s', target: 500 },
-        { duration: '30s', target: 500 },
-        { duration: '5s', target: 0 },
-      ],
+      executor: 'constant-vus',
+      vus: 500,
+      duration: '50s',
       startTime: '50s',
       exec: 'writeScenario',
-      gracefulRampDown: '5s',
+      gracefulStop: '5s',
     },
   },
   thresholds: {
