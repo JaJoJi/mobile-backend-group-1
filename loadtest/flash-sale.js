@@ -80,7 +80,6 @@ export const options = {
       executor: 'constant-vus',
       vus: 500,
       duration: '30s',
-      startTime: '30s',
       exec: 'writeScenario',
       gracefulStop: '5s',
     },
