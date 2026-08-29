@@ -1,13 +1,143 @@
-# Flash Sale System — Backend
+# Flash Sale System — High-Concurrency Backend
 
-A high-concurrency backend for a flash-sale mobile app, built for the **Mobile Backend Architecture & Performance Testing** course project.
+> **Production-grade, high-concurrency Flash Sale backend** engineered to absorb massive, instantaneous request spikes while **completely preventing overselling**.
 
-Implements:
-- **Nginx** load balancer (least_conn) → 3 NestJS instances
-- **NestJS** modular API + **TypeORM** + **PostgreSQL** with **streaming replication** (master + replica)
-- **Redis** for caching + **BullMQ** message queue
-- **JWT** stateless auth, **Bull-Board** dashboard
-- **k6** load test script (1000 read + 500 write concurrent users)
+A distributed flash-sale platform built for the **Mobile Backend Architecture & Performance Testing** course project. It is architected to remain correct and responsive under thousands of concurrent requests per second, using a Redis-first fast-fail hot path backed by a durable PostgreSQL source of truth.
+
+---
+
+## 1. Project Overview & Core Mission
+
+Flash sales produce the single most hostile traffic pattern in e-commerce: a brief, violent burst of demand against a small, fixed inventory. The system's core mission is to serve that burst with **low latency, absolute inventory correctness, and zero oversell**.
+
+Key guarantees the architecture is built to deliver:
+
+- **No overselling.** Inventory is reserved atomically in Redis and re-validated in PostgreSQL; stock can never fall below zero.
+- **Low-latency hot path.** Requests are answered by in-memory Redis state, not by synchronous database round-trips.
+- **Horizontal scale-out.** Nginx fans traffic across six stateless NestJS instances; any instance can serve any request.
+- **Durable, async writes.** Valid orders are persisted through BullMQ, isolating slow I/O from the request path.
+- **Observable behavior.** Cache hit/miss telemetry and structured logs expose exactly how the system performs under load.
+
+The system's philosophy is summarized in one principle: **keep the hot path short, deterministic, and Redis-first, then let the asynchronous worker safely complete the durable workflow in PostgreSQL.**
+
+---
+
+## 2. High-Level Architecture & Connection Flow
+
+### Infrastructure Topology
+
+The platform uses an **event-driven, non-blocking** connection model at the edge and a **stateless** application tier, so session state never lives in a single app instance.
+
+```
+        ┌──────────────┐
+        │  Clients / k6 │
+        └──────┬───────┘
+               │  HTTP (stateless)
+               ▼
+        ┌─────────────────────┐
+        │  Nginx (least_conn) │  ← event-driven, non-blocking
+        └──────────┬──────────┘   handles persistent user connections
+                   │
+                   ▼
+   ┌───────────────────────────────┐
+   │  6 stateless NestJS instances │  (nest-1 … nest-6)
+   │  API + BullMQ Worker each     │
+   └───────────────┬───────────────┘
+                   │
+        ┌──────────┴──────────┐
+        ▼                     ▼
+  ┌─────────────┐      ┌────────────────────┐
+  │ Redis :6379 │      │ PostgreSQL         │
+  │ state +     │      │  ┌──────────────┐  │
+  │ BullMQ      │      │  │ primary :5432│  │
+  └─────────────┘      │  │    │ WAL     │  │
+                       │  │    ▼         │  │
+                       │  │ replica :5433│  │
+                       │  └──────────────┘  │
+                       └────────────────────┘
+```
+
+**Why no sticky sessions:** Nginx routes each request independently using a `least_conn` load-balancing policy. Because **all shared state — inventory, locks, idempotency flags, cache — lives in Redis**, there is no per-user state held in any app instance. This means Nginx can distribute traffic freely across all six instances without session affinity, enabling true horizontal scale-out and seamless failover.
+
+**Read/write split:** writes route to the PostgreSQL **primary**, while reads are load-balanced to the **replica** through TypeORM's `replication` config. Streaming replication (WAL) keeps the replica in sync with the primary.
+
+### Core Service Collaboration
+
+Three NestJS services divide responsibility cleanly across the request lifecycle:
+
+| Service | Role |
+|---|---|
+| **`BootstrapperService`** | Lightweight startup synchronization — performs an **index-only warm-up** of the active product ID list. |
+| **`ProductsService`** | Index-only catalog routing with **on-demand lazy hydration** and **per-product cache telemetry**. |
+| **`OrdersService`** | Redis **fast-fail guard**, distributed **concurrency locking**, and **idempotency control** for purchases. |
+
+#### `BootstrapperService` — Lightweight Startup Sync
+
+On application bootstrap, it loads **only** the IDs of active flash-sale products into Redis (`products:id_list`). It deliberately avoids pre-loading full product detail fragments, keeping startup fast and memory footprint minimal. A singleton lock ensures only one instance performs the warm-up.
+
+#### `ProductsService` — Index-Only Routing + Lazy Hydration
+
+Serves catalog reads from a compact Redis index, fetching paginated IDs first, then hydrating **only the missing** static/stock fragments from PostgreSQL on demand. Concurrent cold-start requests are collapsed into a single database fallback (single-flight deduplication), preventing thundering-herd pressure on the database.
+
+#### `OrdersService` — Redis Fast-Fail Guard
+
+Acts as the request gatekeeper: it checks sold-out and already-purchased flags, acquires a per-user/per-product lock, and atomically reserves stock via Redis `DECR` — all **before** any queue work is scheduled. Oversold or duplicate attempts are rejected immediately with HTTP `409 Conflict`.
+
+---
+
+## 3. The Redis Layer (11 State Patterns)
+
+Redis is the system's shared state registry and coordination layer. It holds **11 distinct key patterns**, each engineered for a single, minimal responsibility. This registry is intentionally **light and memory-efficient** — it stores compact IDs, integers, flags, and counters rather than bloated serialized objects.
+
+| # | Key pattern | Purpose |
+|---|---|---|
+| 1 | `products:id_list` | Active flash-sale product ID index (paginated routing + warm-up). |
+| 2 | `product:static:{productId}` | Immutable static product details (name, price, description). |
+| 3 | `stock:{productId}` | Atomic inventory counter for reservation. |
+| 4 | `product:soldout:{productId}` | Fast-fail flag for exhausted products. |
+| 5 | `order:purchased:{userId}:{productId}` | Idempotency flag preventing duplicate purchases. |
+| 6 | `order:lock:{userId}:{productId}` | Distributed lock serializing concurrent order attempts. |
+| 7 | `products:id_list:warmup_lock` | Startup warm-up singleton lock. |
+| 8 | `products:id_list:rebuild_lock` | Cache-rebuild concurrency control lock. |
+| 9 | `cache:hits:products` | Atomic read-success telemetry counter. |
+| 10 | `cache:misses:products` | Atomic database-fallback telemetry counter. |
+| 11 | `cache:tracked:products` | Set tracking active cache keys for invalidation. |
+
+**Design intent:** each pattern solves one narrow problem — indexing (`1`), fragment caching (`2`), atomic stock (`3`), fail-fast flags (`4`, `5`), concurrency control (`6`, `7`, `8`), and observability/invalidation (`9`–`11`). By keeping values tiny and TTLs tight, the entire state layer stays small enough to remain entirely in Redis memory even at scale.
+
+> Full details (types, TTLs, services) are in [docs/README.md](docs/README.md).
+
+---
+
+## 4. Resiliency & Load Testing Insights
+
+### Load Testing (k6)
+
+The system is validated with **k6** under a mixed workload — **1000 concurrent readers** hitting `GET /api/v1/products` and **500 concurrent writers** posting `POST /api/v1/orders` against a single hot product, over a 30-second burst.
+
+### Fast-Fail Rejection Protects the Database
+
+The write path is deliberately front-loaded with Redis checks. Invalid, duplicate, or oversold requests are rejected at the edge with **HTTP 409 Conflict** — *before* any queue entry is created and *before* any PostgreSQL write occurs. This keeps the database from ever being touched by doomed requests, preserving its capacity for legitimate work.
+
+### Clean BullMQ Pipeline (Zero Job Failures)
+
+Because only valid requests survive the Redis guard, the BullMQ queue receives **exclusively legitimate order candidates**. The worker performs a simple, deterministic job — persist the order, decrement inventory with a `remainingStock > 0` guard, and record the idempotency marker. The result is a **failure-free execution pipeline**: overselling never reaches the queue, so there is nothing for jobs to fail on.
+
+### What the Hit Ratio Really Means
+
+The high cache hit ratio is not just "Redis is working" — it is direct evidence of the lazy-hydration strategy succeeding:
+
+- After the first read hydrates a product's fragments, **every subsequent read is served from Redis** with no database fallback.
+- Misses are counted **per distinct missing product**, not per request, so the metric reflects genuine database pressure rather than request volume.
+- A high hit ratio proves the system absorbs the read burst almost entirely in memory, leaving PostgreSQL to focus on the much smaller, correctly-gated write workload.
+
+---
+
+## 📚 Documentation Map
+
+- **[docs/README.md](docs/README.md)** — deep technical design: full Redis key registry (types/TTLs/services), bootstrap & lazy-loading strategy, and resiliency/failure-handling model.
+- **[flash-sale-backend/README.md](flash-sale-backend/README.md)** — backend setup, runtime commands, and API usage.
+- **This README** — project overview, architecture entry point, and operational guide (below).
 
 ---
 
@@ -28,20 +158,20 @@ cd mobile-backend-group-1
 # 2. Create local env file from template
 cp flash-sale-backend/.env.docker.example flash-sale-backend/.env.docker
 
-# 3. Build + start everything (7 containers)
+# 3. Build + start everything (10 containers)
 docker compose up -d --build
 
 # 4. Wait ~30-60s for stack to be healthy
 docker compose ps --format "table {{.Names}}{{.Status}}"
-# Expected: all 7 containers showing "Up" or "Up (healthy)"
+# Expected: all 10 containers showing "Up" or "Up (healthy)"
 ```
 
 ### Verify it works
 
 ```powershell
-# Hit health through Nginx (LB will round-robin across nest-1/2/3)
+# Hit health through Nginx (LB will round-robin across nest-1…nest-6)
 1..10 | %{ curl -s http://localhost/health }
-# Expected: instanceId cycles between nest-1, nest-2, nest-3
+# Expected: instanceId cycles between nest-1, nest-2, …, nest-6
 
 # Readiness check (verifies DB + Redis)
 curl http://localhost/health/ready
@@ -169,46 +299,9 @@ All point to `http://localhost` (Nginx). Pick whichever fits your workflow.
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Deployment Architecture (10 Services)
 
-```
-                   ┌──────────────┐
-                   │ k6 / Postman │ (host)
-                   └──────┬───────┘
-                          │
-                          ▼
-                ┌─────────────────────┐
-                │  Nginx :80          │  least_conn load balancer
-                │  (least_conn)       │
-                └──┬──────────────┬───┘
-                   │              │
-        ┌──────────┘              └───────────┐
-        ▼                                     ▼
-   ┌─────────┐                          ┌─────────┐
-   │ nest-1  │                          │ nest-3  │  ← 3 NestJS instances
-   │ API +   │      ┌─────────┐          │ API +   │    (HTTP :3000
-   │ Worker  │ ◀──▶ │ nest-2  │ ◀──────▶ │ Worker  │     + BullMQ Worker
-   └────┬────┘      │ API +   │          └────┬────┘     + Bull-Board :3001)
-        │           │ Worker  │               │
-        └───────────┴────┬────┘───────────────┘
-                         │
-              ┌──────────┴──────────┐
-              ▼                     ▼
-       ┌─────────────┐       ┌─────────────┐
-       │ postgres-   │ WAL ▶ │ postgres-   │  ← streaming
-       │ primary     │ ─────▶│ replica     │    replication
-       │ :5432       │       │ :5433       │
-       └─────────────┘       └─────────────┘
-
-              │
-              ▼
-       ┌─────────────┐
-       │ redis       │  ← Cache + BullMQ broker
-       │ :6379       │
-       └─────────────┘
-```
-
-### Services (7 total)
+### Services (10 total)
 
 | Service | Image | Internal port | Host port | Purpose |
 |---|---|---|---|---|
@@ -216,9 +309,12 @@ All point to `http://localhost` (Nginx). Pick whichever fits your workflow.
 | `nest-1` | custom (./flash-sale-backend) | 3000 | 3001 (Bull-Board) | API + Worker #1 |
 | `nest-2` | custom (./flash-sale-backend) | 3000 | — | API + Worker #2 |
 | `nest-3` | custom (./flash-sale-backend) | 3000 | — | API + Worker #3 |
+| `nest-4` | custom (./flash-sale-backend) | 3000 | — | API + Worker #4 |
+| `nest-5` | custom (./flash-sale-backend) | 3000 | — | API + Worker #5 |
+| `nest-6` | custom (./flash-sale-backend) | 3000 | — | API + Worker #6 |
 | `redis` | redis:7-alpine | 6379 | 6379 | Cache + BullMQ broker |
-| `postgres-primary` | bitnamilegacy/postgresql:16 | 5432 | 5432 | DB master (TypeORM writes) |
-| `postgres-replica` | bitnamilegacy/postgresql:16 | 5432 | 5433 | DB replica (TypeORM reads) |
+| `postgres-primary` | bitnamilegacy/postgresql:16 | 5432 | 5432 | DB primary (TypeORM writes) |
+| `postgres-replica` | bitnamilegacy/postgresql:16 | 5432 | 5433 | DB replica (TypeORM reads, streaming replication) |
 
 ### Key design choices
 
@@ -230,7 +326,7 @@ All point to `http://localhost` (Nginx). Pick whichever fits your workflow.
 | Duplicate order prevention | Unique constraint `(userId, productId)` on `orders` table (DB safety net) |
 | Read scaling | TypeORM `replication: { master, slaves }` — reads auto-route to replica |
 | Schema management | Migrations (not `synchronize`) — runs on app boot via `migrationsRun: true` |
-| Connection pooling | max=100 per node (3 instances × 100 = 300 connections to PG) |
+| Connection pooling | max=100 per node (6 instances × 100 = 600 connections to PG) |
 | Observability | Structured logs (pino) + trace IDs + Bull-Board dashboard |
 | Health checks | `/health/live` (always 200) + `/health/ready` (checks DB+Redis) |
 
@@ -240,13 +336,13 @@ All point to `http://localhost` (Nginx). Pick whichever fits your workflow.
 
 ```
 mobile-backend-group-1/
-├── docker-compose.yml                 # 7-service stack
+├── docker-compose.yml                 # 10-service stack
 ├── README.md                          # ← you are here
 ├── products-seed.json                 # seed data (20 products)
 │
 ├── docker/
 │   └── nginx/
-│       └── nginx.conf                 # least_conn LB → nest-1/2/3
+│       └── nginx.conf                 # least_conn LB → nest-1…nest-6
 │
 ├── flash-sale-backend/                # NestJS app
 │   ├── Dockerfile                     # multi-stage (node:20-alpine)
