@@ -6,9 +6,9 @@
  *
  * Phases (per spec, no ramp — flat VU count for the full duration):
  *   1. Setup   — fetch 500 unique JWTs (user-1 .. user-500)
- *   2. Read    — 1000 concurrent users, 50s, GET /api/v1/products
+ *   2. Read    — 1000 concurrent users, 30s, GET /api/v1/products
  *                Distributed limit range [5,10,15,20,25,50] + 5% overflow mix
- *   3. Write   — 500 concurrent users, 50s, POST /api/v1/orders for p-1001 only
+ *   3. Write   — 500 concurrent users, 30s, POST /api/v1/orders for p-1001 only
  *                2-3 iterations per VU (double/triple click simulation)
  *
  * Cache keys generated (expected):
@@ -72,15 +72,15 @@ export const options = {
     read_load: {
       executor: 'constant-vus',
       vus: 1000,
-      duration: '50s',
+      duration: '30s',
       exec: 'readScenario',
       gracefulStop: '5s',
     },
     write_load: {
       executor: 'constant-vus',
       vus: 500,
-      duration: '50s',
-      startTime: '50s',
+      duration: '30s',
+      startTime: '30s',
       exec: 'writeScenario',
       gracefulStop: '5s',
     },

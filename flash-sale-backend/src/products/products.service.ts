@@ -127,10 +127,10 @@ export class ProductsService {
 
         return {
           ...product,
-          stock: stockMap.get(id) ?? 0,
+          remainingStock: stockMap.get(id) ?? 0,
         };
       })
-      .filter((p): p is ProductStaticRecord & { stock: number } => p !== null);
+      .filter((p): p is ProductStaticRecord & { remainingStock: number } => p !== null);
 
     const result = {
       status: 'success',
@@ -232,6 +232,10 @@ export class ProductsService {
     return `stock:${id}`;
   }
 
+  private soldOutKey(id: string): string {
+    return `product:soldout:${id}`;
+  }
+
   private parseJson<T>(raw: string): T | null {
     try {
       return raw ? (JSON.parse(raw) as T) : null;
@@ -311,6 +315,8 @@ export class ProductsService {
         isFlashSaleActive: Boolean(row.isFlashSaleActive),
       };
 
+      const stockValue = Number(row.remainingStock ?? row.availableStock ?? 0);
+
       byId[row.productId] = staticRecord;
       writeBack.push({
         key: this.staticKey(row.productId),
@@ -318,11 +324,28 @@ export class ProductsService {
         ttlSeconds: 24 * 60 * 60,
       });
 
+      // stock:{id} uses a 1-hour TTL. The DECR-by-API overflow counter must
+      // remain authoritative for the entire flash sale duration (typically
+      // <1h). A short TTL (e.g. 30s) caused cold-start bypass during the
+      // k6 40s test: once stockKey TTL expired mid-test, Lua saw stockVal=nil
+      // and skipped DECR entirely, letting thousands of overflow requests
+      // through to the queue. 1h TTL keeps the counter alive throughout the
+      // sale; it self-heals on next hydration if PG ever drifts.
       writeBack.push({
         key: this.stockKey(row.productId),
-        value: Number(row.remainingStock ?? row.availableStock ?? 0),
-        ttlSeconds: 24 * 60 * 60,
+        value: stockValue,
+        ttlSeconds: 60 * 60,
       });
+
+      // Sync the sticky sold-out flag if PG confirms remainingStock=0, so
+      // the API fast-fail Lua catches it without waiting for a worker SET.
+      if (stockValue === 0) {
+        writeBack.push({
+          key: this.soldOutKey(row.productId),
+          value: '1',
+          ttlSeconds: 24 * 60 * 60,
+        });
+      }
     }
 
     if (writeBack.length > 0) {

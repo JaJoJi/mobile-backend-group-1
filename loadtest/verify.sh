@@ -189,13 +189,10 @@ RATIO=$(echo "$CACHE_STATS" | grep -o '"hitRatio":[0-9.]*' | cut -d':' -f2)
 TOTAL_REQS=${HITS:-0}
 TOTAL_REQS=$((TOTAL_REQS + ${MISSES:-0}))
 
-TRACKED_KEYS=$("${REDIS_CMD[@]}" SMEMBERS cache:tracked:products | wc -l | tr -d ' ')
-
 echo ""
 echo "  cache hits         : ${HITS:-0}"
 echo "  cache misses       : ${MISSES:-0}"
 echo "  cache hit ratio    : ${RATIO:-0}"
-echo "  tracked cache keys : $TRACKED_KEYS"
 echo ""
 
 if [ "${MISSES:-0}" -gt 0 ]; then

@@ -85,7 +85,7 @@ The system uses 11 Redis keys/patterns for the flash-sale orchestration layer. E
 | 8 | `products:id_list:rebuild_lock` | String lock | 10 seconds | `ProductsService` | Concurrency control during index rebuilds when the Redis list is empty or missing. |
 | 9 | `cache:hits:products` | Counter | No TTL | `ProductsService`, `RedisService` | Atomic success counter for product-fragment cache hits. |
 | 10 | `cache:misses:products` | Counter | No TTL | `ProductsService`, `RedisService` | Atomic database fallback counter for actual product-fragment misses. |
-| 11 | `cache:tracked:products` | Set | No TTL | `RedisService`, `OrdersProcessor` | Tracks product cache keys that were written so they can be invalidated after successful orders. |
+| 11 | _(reserved)_ | — | — | — | Reserved for future admin-driven invalidation. Previously planned but never wired up — no caller exists for `RedisService.trackCacheKey`. Cache consistency for `stock:{productId}` is maintained via atomic DECR on every order. |
 
 ### Why these keys matter
 
