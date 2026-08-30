@@ -11,6 +11,7 @@ export interface ProductStaticRecord {
   description: string | null;
   price: number;
   availableStock: number;
+  remainingStock?: number;
   isFlashSaleActive: boolean;
 }
 
@@ -33,77 +34,49 @@ export class ProductsService {
     private readonly redis: RedisService,
   ) { }
 
-  // In-memory cache for immutable static product records. Populated on first read.
-  private readonly staticCache = new Map<string, ProductStaticRecord>();
-
   async findAll(page: number, limit: number) {
-    const listKey = ProductsService.INDEX_KEY;
+    await this.ensureActiveProductIdIndex();
+
+    const listKey = 'products:id_list';
     const start = (page - 1) * limit;
     const stop = start + limit - 1;
 
-    // Fetch IDs and total count in parallel
     const [ids, total] = await Promise.all([
       this.redis.lrange(listKey, start, stop),
       this.redis.llen(listKey),
     ]);
 
-    if (total === 0) {
-      await this.ensureActiveProductIdIndex();
-      const [rebuiltIds, rebuiltTotal] = await Promise.all([
-        this.redis.lrange(listKey, start, stop),
-        this.redis.llen(listKey),
-      ]);
-      return this.processProductsList(rebuiltIds, rebuiltTotal, page, limit);
-    }
-
-    return this.processProductsList(ids, total, page, limit);
-  }
-
-  private async processProductsList(ids: string[], total: number, page: number, limit: number) {
     if (ids.length === 0) {
-      return {
+      const emptyResult = {
         status: 'success',
         data: [],
         meta: {
-          total,
+          total: 0,
           page,
           limit,
-          totalPages: Math.max(1, Math.ceil(total / limit)),
+          totalPages: 0,
         },
       };
+      return emptyResult;
     }
 
-    // Identify which static keys are missing from in-memory cache
-    const missingStaticIds = ids.filter((id) => !this.staticCache.has(id));
+    const detailKeys = ids.map((id) => this.staticKey(id));
     const stockKeys = ids.map((id) => this.stockKey(id));
 
-    // Parallel fetch: missing static records from Redis (if any) + all stock keys from Redis
-    const [missingStaticValues, stockValues] = await Promise.all([
-      missingStaticIds.length > 0
-        ? this.redis.mgetStrings(missingStaticIds.map((id) => this.staticKey(id)))
-        : Promise.resolve([]),
+    const [detailValues, stockValues] = await Promise.all([
+      this.redis.mgetStrings(detailKeys),
       this.redis.mgetStrings(stockKeys),
     ]);
-
-    // Populate in-memory static cache from Redis MGET results
-    for (const [index, id] of missingStaticIds.entries()) {
-      const val = missingStaticValues[index];
-      if (val) {
-        const parsed = this.parseJson<ProductStaticRecord>(val);
-        if (parsed) {
-          this.staticCache.set(id, parsed);
-        }
-      }
-    }
 
     const detailMap = new Map<string, ProductStaticRecord>();
     const stockMap = new Map<string, number>();
     let fragmentCacheHit = true;
 
     for (const [index, id] of ids.entries()) {
-      const cachedDetail = this.staticCache.get(id);
-      if (cachedDetail) {
-        detailMap.set(id, cachedDetail);
+      const detailValue = detailValues[index];
+      const parsedDetail = detailValue ? this.parseJson<ProductStaticRecord>(detailValue) : null;
+      if (parsedDetail) {
+        detailMap.set(id, parsedDetail);
       } else {
         fragmentCacheHit = false;
       }
@@ -129,7 +102,6 @@ export class ProductsService {
       for (const id of missingIds) {
         const record = missingProducts[id];
         if (record) {
-          this.staticCache.set(id, record);
           detailMap.set(id, record);
         }
 
@@ -141,9 +113,12 @@ export class ProductsService {
     }
 
     if (fragmentCacheHit) {
-      // Non-blocking telemetry reporting
       this.redis.recordFragmentCacheHit().catch(() => { });
     }
+    // Note: cache misses are NOT counted here. Miss counting lives inside
+    // fetchMissingProductsFromDb() so it reflects each distinct product that was
+    // actually loaded from PostgreSQL, independent of request batching and
+    // single-flight deduplication.
 
     // Data stitching: join the immutable static fragment with the volatile stock fragment
     const data = ids
@@ -158,7 +133,7 @@ export class ProductsService {
       })
       .filter((p): p is ProductStaticRecord & { remainingStock: number } => p !== null);
 
-    return {
+    const result = {
       status: 'success',
       data,
       meta: {
@@ -168,6 +143,9 @@ export class ProductsService {
         totalPages: Math.max(1, Math.ceil(total / limit)),
       },
     };
+
+
+    return result;
   }
 
   private async ensureActiveProductIdIndex(): Promise<void> {
@@ -267,9 +245,28 @@ export class ProductsService {
     }
   }
 
+  // On a Redis cache miss, return the LIVE remaining stock, never the initial
+  // total. Preference order:
+  //   1. record.remainingStock (the live value maintained by the worker's
+  //      pessimistic PG transaction)
+  //   2. fallback (the already-cached stock fragment, if any)
+  //   3. record.availableStock (initial total) as a last resort
   private extractStock(record: ProductStaticRecord | undefined, fallback: number | undefined): number | null {
     if (record && typeof record === 'object') {
-      return Number(record?.availableStock ?? record?.['remainingStock'] ?? fallback ?? 0);
+      const remaining = Number(record.remainingStock ?? record['remainingStock'] ?? NaN);
+      if (Number.isFinite(remaining) && remaining >= 0) {
+        return remaining;
+      }
+
+      const fallbackValue = Number(fallback ?? NaN);
+      if (Number.isFinite(fallbackValue) && fallbackValue >= 0) {
+        return fallbackValue;
+      }
+
+      const total = Number(record.availableStock ?? NaN);
+      if (Number.isFinite(total) && total >= 0) {
+        return total;
+      }
     }
 
     if (fallback != null) {

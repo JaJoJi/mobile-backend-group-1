@@ -125,7 +125,7 @@ per instance: min:10, idle:30s, connect timeout:5s
 | **`BootstrapperService`** | Warm-up `products:id_list` ตอน startup (index-only, ไม่โหลด payload) |
 | **`ProductsService`** | Read path หลัก — index-only routing + lazy hydration + cache telemetry |
 | **`OrdersService`** | Fast-fail guard + DECR overflow tracker + cooldown + BullMQ enqueue |
-| **`OrdersProcessor`** (Worker) | Pessimistic PG lock + write-through cache invalidation |
+| **`OrdersProcessor`** (Worker) | Pessimistic PG lock + post-commit Redis update |
 | **`AuthService`** | JWT generation (stateless) |
 
 ---
@@ -142,9 +142,9 @@ Redis ถือเป็น **shared state registry และ coordination layer
 | 2 | `product:static:{productId}` | String (JSON) | 24 ชม. | Static product details (name, price, description) |
 | 3 | `stock:{productId}` | String (int) | 1 ชม. | **Short-TTL overflow counter** — DECR'd atomically ที่ API layer |
 | 4 | `product:soldout:{productId}` | String flag | 24 ชม. | **Sticky sold-out flag** — authoritative signal จาก worker (PG confirms stock=0) |
-| 5 | `order:purchased:{userId}:{productId}` | String flag | 24 ชม. | Idempotency marker (set in-tx ก่อน INSERT) |
+| 5 | `order:purchased:{userId}:{productId}` | String flag | 24 ชม. | Idempotency marker (set post-commit หลัง COMMIT สำเร็จ) |
 | 6 | `order:lock:{userId}:{productId}` | String lock | 60 วินาที | In-flight marker (ครอบคลุมทั้ง job lifecycle) |
-| 7 | `user:cooldown:{userId}:{productId}` | String flag | 3 วินาที | **Same-user dedup** — ปิด race window ระหว่าง API Lua และ worker in-tx SET |
+| 7 | `user:cooldown:{userId}:{productId}` | String flag | 3 วินาที | **Same-user dedup** — ปิด race window ระหว่าง API Lua และ worker post-commit SET |
 | 8 | `products:id_list:warmup_lock` | String lock | 30 วินาที | Startup warm-up singleton lock |
 | 9 | `products:id_list:rebuild_lock` | String lock | 10 วินาที | Cache-rebuild concurrency control |
 | 10 | `cache:hits:products` | Counter | - | Atomic read-success telemetry |
@@ -155,7 +155,7 @@ Redis ถือเป็น **shared state registry และ coordination layer
 ระบบมี **2 ชั้น** ในการป้องกัน overselling:
 
 **Layer 1: Sticky Flag** (`product:soldout:{id}`, TTL 24h)
-- Worker ตั้งค่าเมื่อ PG ยืนยัน `remainingStock=0` (in-tx ก่อน COMMIT)
+- Worker ตั้งค่าเมื่อ PG ยืนยัน `remainingStock=0` (post-commit หลัง COMMIT สำเร็จ)
 - ProductsService hydration ก็ตั้งค่าถ้า hydrate มาเจอ 0
 - Lua fast-fail เช็คตัวนี้เป็นชั้นแรก → SOLD_OUT 409
 
@@ -164,10 +164,10 @@ Redis ถือเป็น **shared state registry และ coordination layer
 - ถ้า DECR ติดลบ → INCR rollback + DEL lock + DEL cooldown → return `TOO_MANY_REQUESTS` (HTTP 429)
 - Cold-start protection: ถ้า key หาย → ถือว่า sold-out (over-reject ปลอดภัยกว่า under-reject)
 
-### 3.3 Cache Consistency: Write-Through SET
+### 3.3 Cache Consistency: Post-Commit Redis Update
 
-Worker (in-tx ก่อน COMMIT) SETs ค่าใหม่:
-- `stock:{id} = String(remainingStock - 1), EX 3600` — refresh counter
+Worker (หลัง COMMIT สำเร็จ) SETs ค่าใหม่:
+- `order:purchased:{u}:{p} = "1", EX 86400` — idempotency marker (เฉพาะเมื่อ INSERT สำเร็จ)
 - ถ้า `N-1==0` → `product:soldout:{id} = "1", EX 86400` — sticky flag
 
 Worker ปลด lock ใน `finally`:
@@ -291,21 +291,25 @@ Content-Type: application/json
 
 API GET /api/v1/products ต้องคืนค่า `remainingStock` ที่ถูกต้องเสมอ ดังนั้นเมื่อ worker ตัดสต็อกสำเร็จ ระบบต้อง update cache ทันที
 
-### 5.2 Invalidation Strategy: Write-Through SET
+### 5.2 Invalidation Strategy: Post-Commit Redis Update
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Worker (in-tx, before COMMIT, row lock held):          │
+│  Worker (row lock held inside PG transaction):           │
 │                                                          │
 │  1. UPDATE products SET remainingStock = N-1             │
-│  2. SET stock:{id} = String(N-1), EX 3600                │
-│     → Next read sees fresh value                         │
-│  3. if N-1==0 → SET product:soldout:{id} = "1", EX 86400│
-│     → Sticky flag survives across stockKey TTL            │
-│  4. INSERT order                                          │
-│  5. COMMIT                                                │
-│  6. SET order:purchased:{u}:{p} = "1", EX 86400         │
-│  7. finally: DEL order:lock:{u}:{p}                      │
+│  2. INSERT order                                         │
+│  3. COMMIT                                               │
+│                                                          │
+│  4. POST-COMMIT: SET order:purchased:{u}:{p} = "1"      │
+│     EX 86400                                             │
+│  5. POST-COMMIT: if N-1 == 0 → SET product:soldout:{id} │
+│     = "1", EX 86400                                      │
+│  6. finally: DEL order:lock:{u}:{p}                      │
+│                                                          │
+│  Redis เขียนเฉพาะเมื่อ DB COMMIT สำเร็จ → ไม่เกิด         │
+│  false-positive sold-out / purchased หลัง DB rollback    │
+│  (เช่น 23505 duplicate-key failure)                      │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -355,7 +359,7 @@ API GET /api/v1/products ต้องคืนค่า `remainingStock` ที�
 
 - **Set**: API Lua atomically หลัง lock acquire (TTL 3 วินาที)
 - **Check**: API Lua เช็คเป็นชั้นแรกสุด
-- **ปิด race window**: ระหว่าง worker `in-tx SET order:purchased` กับ API Lua check
+- **ปิด race window**: ระหว่าง worker `COMMIT` และ Redis `order:purchased` post-commit write
 
 **ทำไมต้องมี cooldown แยก?** เพราะ:
 - `lockKey` ถูก release ใน ~10ms (หลัง worker DEL)
@@ -369,7 +373,7 @@ BEGIN;
 SET LOCAL lock_timeout = 2000;
 SELECT remainingStock FROM products WHERE productId = $1 FOR UPDATE;
 -- ถ้า N > 0 → UPDATE และ INSERT
--- ถ้า N <= 0 → recordOrder(FAILED, OUT_OF_STOCK) และ throw
+-- ถ้า N <= 0 → throw OUT_OF_STOCK (ไม่เขียน FAILED row)
 COMMIT;
 ```
 
@@ -385,7 +389,7 @@ ALTER TABLE orders ADD CONSTRAINT UQ_orders_user_product UNIQUE (userId, product
 
 | สถานการณ์ | API Lua | Worker Defense | PG Guard | DB UNIQUE |
 |---|---|---|---|---|
-| ของหมด (stock=0 ใน PG) | `SOLD_OUT` | `OUT_OF_STOCK` → FAILED | ✓ | - |
+| ของหมด (stock=0 ใน PG) | `SOLD_OUT` | `OUT_OF_STOCK` → throw (no row) | ✓ | - |
 | User ซื้อซ้ำ (กด 2 ครั้งใน 3s) | `ALREADY_PURCHASED` (cooldown) | `ALREADY_PURCHASED` | - | - |
 | User ซื้อซ้ำ (หลัง 3s แต่ใน 24h) | `ALREADY_PURCHASED` (purchasedKey) | - | - | - |
 | User กดพร้อมกัน (sub-100ms) | `LOCKED` (lockKey) | - | - | - |
@@ -486,24 +490,15 @@ export class OrdersProcessor {
         [remainingStock - 1, productId],
       );
 
-      // 5. Write-through cache (in-tx)
-      await this.redis.raw().set(
-        stockKey,
-        String(remainingStock - 1),
-        'EX', 3600,
-      );
-      if (remainingStock - 1 === 0) {
-        await this.redis.set(soldOutKey, '1', 24 * 60 * 60);
-      }
-
-      // 6. Idempotency in-tx (closes 23505 race)
-      await this.redis.set(purchasedKey, '1', 24 * 60 * 60);
-
-      // 7. INSERT order
+      // 5. INSERT order (no Redis writes in-tx)
       await manager.query(`INSERT INTO orders ... SUCCESS ...`);
-    });
+    }); // COMMIT here — row lock released
 
-    // Post-commit: nothing (purchasedKey already set in-tx)
+    // POST-COMMIT: Redis writes only after DB commit succeeds
+    await this.redis.set(purchasedKey, '1', 24 * 60 * 60);
+    if (remainingStock - 1 === 0) {
+      await this.redis.set(soldOutKey, '1', 24 * 60 * 60);
+    }
   } finally {
     // Release lock
     await this.redis.del(lockKey);
@@ -523,12 +518,12 @@ export class OrdersProcessor {
 - โอกาสสำเร็จในครั้งที่ 2 สูง (lock queue clear)
 - Final result: 0 งานหายจาก lock_timeout
 
-### 8.4 ทำไม `purchasedKey` Set In-Tx ก่อน INSERT?
+### 8.4 ทำไม `purchasedKey` ต้อง set หลัง `COMMIT`?
 
-- **Race**: 2 workers สำหรับ user เดียวกัน pass defense check (ที่ start of process) พร้อมกัน
-- Worker A: defense OK → BEGIN tx → UPDATE → SET purchasedKey → INSERT → COMMIT
-- Worker B: defense OK (เพราะ A ยังไม่ได้ SET) → BLOCK บน row lock → หลัง A COMMIT → SELECT → UPDATE → SET purchasedKey → INSERT → **23505!**
-- **In-tx SET** ก่อน INSERT ปิด race นี้: Worker B จะ 23505 แต่ purchasedKey ถูก set แล้ว (false positive OK)
+- **ปัญหาเดิม**: ถ้า set Redis ใน transaction ก่อน `COMMIT` แล้ว `INSERT` หรือ transaction ล้ม (เช่น `23505`), PostgreSQL rollback แต่ Redis ยังมี stale flag → เกิด false-positive sold-out / purchased
+- **แก้เป็น post-commit**: worker ทำ DB work ทั้งหมดใน transaction ก่อน, แล้ว set `order:purchased` กับ `product:soldout` หลัง `COMMIT` สำเร็จเท่านั้น
+- **ผลลัพธ์**: Redis ไม่เคย claim ว่าซื้อสำเร็จหรือ sold-out ถ้า DB rollback จริง
+- **Safety net**: DB unique constraint + API Lua cooldown ยังป้องกัน duplicate purchase เมื่อ Redis state sync lagging เล็กน้อยหลัง commit
 
 ---
 
@@ -589,7 +584,7 @@ order_conflicted_total: ~20,000 (overflow correctly rejected)
 | Fix | Before | After | Δ |
 |---|---|---|---|
 | Fix 1: Worker ไม่ SET stockKey | 167 ACCEPTED | 50 ACCEPTED | -70% |
-| Fix 3: In-tx purchasedKey | 34 × 23505 | 0 | -100% |
+| Fix 3: Post-commit purchasedKey | 34 × 23505 | 0 | -100% |
 | Fix 4: ไม่เขียน FAILED OUT_OF_STOCK | 63 × PG tx | 0 | -100% |
 | Cold-start protection | 1254 ACCEPTED (cold) | 0 ACCEPTED | -100% |
 | stockKey TTL 30s → 1h | race window | closed | - |

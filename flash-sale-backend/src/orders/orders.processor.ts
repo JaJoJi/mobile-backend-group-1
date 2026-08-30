@@ -1,4 +1,4 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
 import type { Job } from 'bullmq';
@@ -166,6 +166,50 @@ export class OrdersProcessor extends WorkerHost {
       // Best-effort lock release. If the API was a no-op (Lua returned OK
       // but the API process died before DEL), the TTL will clean it up.
       await this.redis.del(lockKey);
+    }
+  }
+
+  // Compensating stock restore for a job that FAILED to materialize an order in
+  // PostgreSQL. The API's Lua fast-fail already DECR'd the Redis stock counter
+  // before enqueueing this job. When the worker ultimately fails (DB rollback,
+  // transient error, validation failure, crash), that DECR is now "orphaned" —
+  // Redis under-reports stock relative to PG, which looks like ghost sold-out.
+  //
+  // We hook the `failed` event (not `process`'s catch) because it fires exactly
+  // ONCE per job after all `attempts` are exhausted. Hooking the catch block
+  // would compensate on every retry attempt and double-restore if a later retry
+  // succeeded. The marker key makes the INCR idempotent even across duplicate
+  // `failed` emissions or cross-instance races.
+  @OnWorkerEvent('failed')
+  async onJobFailed(job: Job<OrderJobData>, error: Error): Promise<void> {
+    const { userId, productId } = job.data;
+    const stockKey = `stock:${productId}`;
+    const restoreKey = `order:stock:restore:${job.id ?? `${userId}:${productId}`}`;
+
+    // OUT_OF_STOCK means PostgreSQL was already at zero before this job ran: no
+    // PG decrement was rolled back, and the worker's in-tx logic has already set
+    // (or will set) the sticky sold-out flag. Compensating here would push Redis
+    // ABOVE zero and defeat the sold-out fast-fail, inviting a flood of wasted
+    // jobs. Every other failure left Redis one lower than PG, so restore once.
+    if (error?.message === 'OUT_OF_STOCK') {
+      this.logger.warn(
+        { jobId: job.id, userId, productId },
+        'job failed with OUT_OF_STOCK; skipping stock compensation',
+      );
+      return;
+    }
+
+    const restored = await this.redis.compensateFailedStock(
+      stockKey,
+      restoreKey,
+      24 * 60 * 60,
+    );
+
+    if (restored > 0) {
+      this.logger.warn(
+        { jobId: job.id, userId, productId, restoredTo: restored },
+        'compensated Redis stock for failed order job',
+      );
     }
   }
 
