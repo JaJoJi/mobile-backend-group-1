@@ -182,13 +182,10 @@ $Hits = if ($CacheStats -match '"hits":(\d+)') { $Matches[1] } else { '0' }
 $Misses = if ($CacheStats -match '"misses":(\d+)') { $Matches[1] } else { '0' }
 $Ratio = if ($CacheStats -match '"hitRatio":([\d.]+)') { $Matches[1] } else { '0' }
 
-$TrackedKeys = (Invoke-Redis 'SMEMBERS' 'cache:tracked:products') | Where-Object { $_ -and $_.Trim() -ne '' } | Measure-Object | Select-Object -ExpandProperty Count
-
 Write-Host ''
 Write-Host "  cache hits         : $Hits"
 Write-Host "  cache misses       : $Misses"
 Write-Host "  cache hit ratio    : $Ratio"
-Write-Host "  tracked cache keys : $TrackedKeys"
 Write-Host ''
 
 if ([int]$Misses -gt 0) {
