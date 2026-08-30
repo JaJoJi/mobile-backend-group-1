@@ -31,51 +31,79 @@ export class ProductsService {
   constructor(
     @InjectRepository(Product) private readonly repo: Repository<Product>,
     private readonly redis: RedisService,
-  ) {}
+  ) { }
+
+  // In-memory cache for immutable static product records. Populated on first read.
+  private readonly staticCache = new Map<string, ProductStaticRecord>();
 
   async findAll(page: number, limit: number) {
-    await this.ensureActiveProductIdIndex();
-
-    const listKey = 'products:id_list';
+    const listKey = ProductsService.INDEX_KEY;
     const start = (page - 1) * limit;
     const stop = start + limit - 1;
 
+    // Fetch IDs and total count in parallel
     const [ids, total] = await Promise.all([
       this.redis.lrange(listKey, start, stop),
       this.redis.llen(listKey),
     ]);
 
+    if (total === 0) {
+      await this.ensureActiveProductIdIndex();
+      const [rebuiltIds, rebuiltTotal] = await Promise.all([
+        this.redis.lrange(listKey, start, stop),
+        this.redis.llen(listKey),
+      ]);
+      return this.processProductsList(rebuiltIds, rebuiltTotal, page, limit);
+    }
+
+    return this.processProductsList(ids, total, page, limit);
+  }
+
+  private async processProductsList(ids: string[], total: number, page: number, limit: number) {
     if (ids.length === 0) {
-      const emptyResult = {
+      return {
         status: 'success',
         data: [],
         meta: {
-          total: 0,
+          total,
           page,
           limit,
-          totalPages: 0,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
         },
       };
-      return emptyResult;
     }
 
-    const detailKeys = ids.map((id) => this.staticKey(id));
+    // Identify which static keys are missing from in-memory cache
+    const missingStaticIds = ids.filter((id) => !this.staticCache.has(id));
     const stockKeys = ids.map((id) => this.stockKey(id));
 
-    const [detailValues, stockValues] = await Promise.all([
-      this.redis.mgetStrings(detailKeys),
+    // Parallel fetch: missing static records from Redis (if any) + all stock keys from Redis
+    const [missingStaticValues, stockValues] = await Promise.all([
+      missingStaticIds.length > 0
+        ? this.redis.mgetStrings(missingStaticIds.map((id) => this.staticKey(id)))
+        : Promise.resolve([]),
       this.redis.mgetStrings(stockKeys),
     ]);
+
+    // Populate in-memory static cache from Redis MGET results
+    for (const [index, id] of missingStaticIds.entries()) {
+      const val = missingStaticValues[index];
+      if (val) {
+        const parsed = this.parseJson<ProductStaticRecord>(val);
+        if (parsed) {
+          this.staticCache.set(id, parsed);
+        }
+      }
+    }
 
     const detailMap = new Map<string, ProductStaticRecord>();
     const stockMap = new Map<string, number>();
     let fragmentCacheHit = true;
 
     for (const [index, id] of ids.entries()) {
-      const detailValue = detailValues[index];
-      const parsedDetail = detailValue ? this.parseJson<ProductStaticRecord>(detailValue) : null;
-      if (parsedDetail) {
-        detailMap.set(id, parsedDetail);
+      const cachedDetail = this.staticCache.get(id);
+      if (cachedDetail) {
+        detailMap.set(id, cachedDetail);
       } else {
         fragmentCacheHit = false;
       }
@@ -101,6 +129,7 @@ export class ProductsService {
       for (const id of missingIds) {
         const record = missingProducts[id];
         if (record) {
+          this.staticCache.set(id, record);
           detailMap.set(id, record);
         }
 
@@ -112,12 +141,9 @@ export class ProductsService {
     }
 
     if (fragmentCacheHit) {
-      await this.redis.recordFragmentCacheHit();
+      // Non-blocking telemetry reporting
+      this.redis.recordFragmentCacheHit().catch(() => { });
     }
-    // Note: cache misses are NOT counted here. Miss counting lives inside
-    // fetchMissingProductsFromDb() so it reflects each distinct product that was
-    // actually loaded from PostgreSQL, independent of request batching and
-    // single-flight deduplication.
 
     // Data stitching: join the immutable static fragment with the volatile stock fragment
     const data = ids
@@ -132,7 +158,7 @@ export class ProductsService {
       })
       .filter((p): p is ProductStaticRecord & { remainingStock: number } => p !== null);
 
-    const result = {
+    return {
       status: 'success',
       data,
       meta: {
@@ -142,9 +168,6 @@ export class ProductsService {
         totalPages: Math.max(1, Math.ceil(total / limit)),
       },
     };
-
-
-    return result;
   }
 
   private async ensureActiveProductIdIndex(): Promise<void> {

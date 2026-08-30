@@ -14,7 +14,11 @@ async function bootstrap() {
 
   const config = app.get(ConfigService);
   const port = config.get<number>('PORT') ?? 3000;
-  await app.listen(port);
+  const server = await app.listen(port);
+  if (server && typeof server.setTimeout === 'function') {
+    server.keepAliveTimeout = 65000;
+    server.headersTimeout = 66000;
+  }
 
   const adminPort = config.get<number>('ADMIN_PORT') ?? 3001;
   const adminApp = express();
