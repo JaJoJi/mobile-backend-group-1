@@ -40,7 +40,6 @@ export class OrdersProcessor extends WorkerHost {
     const { userId, productId, traceId } = job.data;
     const lockKey = `order:lock:${userId}:${productId}`;
     const soldOutKey = `product:soldout:${productId}`;
-    const stockKey = `stock:${productId}`;
     const purchasedKey = `order:purchased:${userId}:${productId}`;
     const logCtx = { jobId: job.id, userId, productId, traceId };
 
@@ -59,10 +58,14 @@ export class OrdersProcessor extends WorkerHost {
       throw new Error('ALREADY_PURCHASED');
     }
 
-    let pgDecremented = false;
-    let orderInserted = false;
     let remainingStock = 0;
 
+    // ------------------------------------------------------------------
+    // No Redis state mutations happen inside the transaction below.
+    // `product:soldout` and `order:purchased` are only written POST-COMMIT,
+    // so a rollback (e.g. 23505 duplicate, OUT_OF_STOCK, lock timeout) can
+    // never leave stale sold-out / purchased flags that contradict the DB.
+    // ------------------------------------------------------------------
     try {
       // PESSIMISTIC TRANSACTION
       // =======================
@@ -88,10 +91,6 @@ export class OrdersProcessor extends WorkerHost {
         remainingStock = Number(productRows[0].remainingStock);
 
         if (remainingStock <= 0) {
-          // Fix 4: do NOT write a FAILED audit row here. We haven't touched
-          // the DB yet inside this transaction, and the wasted PG write was
-          // adding load with no integrity benefit. Just throw and let the
-          // outer catch + finally clean up.
           this.logger.warn(
             { ...logCtx, reason: 'OUT_OF_STOCK' },
             'order rejected: out of stock',
@@ -104,44 +103,17 @@ export class OrdersProcessor extends WorkerHost {
           'UPDATE products SET "remainingStock" = $1 WHERE "productId" = $2',
           [remainingStock - 1, productId],
         );
-        pgDecremented = true;
 
-        // Fix 1: REMOVED worker SET stockKey.
-        // The Lua fast-fail DECR is the authoritative source of stockKey.
-        // Worker SETs were RESETTING the counter back up (race vs concurrent
-        // DECRs), so the counter never reached 0 and DECR never caught
-        // overflow. stockKey now self-heals via:
-        //   - Lua DECR (decrements monotonically)
-        //   - ProductsService hydration after 30s TTL expiry (re-fetches
-        //     the true remainingStock from PG replica)
-        // Worker only owns the sold-out flag (sticky, authoritative).
-
-        // Sticky sold-out flag (24h TTL). Set inside the transaction so
-        // it's only visible to the API fast-fail after COMMIT succeeds.
-        if (remainingStock - 1 === 0) {
-          await this.redis.set(soldOutKey, '1', 24 * 60 * 60);
-        }
-
-        // Fix 3: SET purchasedKey IN-TX (after UPDATE, before INSERT).
-        // This closes the 23505 race: if a concurrent sibling worker for
-        // the same (user, product) also reaches INSERT, at least one will
-        // see the purchasedKey already set (either via API fast-fail or
-        // worker defense-in-depth). Trade-off: on a real 23505 rollback,
-        // purchasedKey stays set (false positive) — the user is blocked
-        // for 24h even though the duplicate was rejected. Acceptable
-        // because 23505 implies a prior SUCCESS for the same user-product.
-        await this.redis.set(purchasedKey, '1', 24 * 60 * 60);
-
-        // 4. INSERT order. If UNIQUE (userId, productId) collides, the whole
+        // 3. INSERT order. If UNIQUE (userId, productId) collides, the whole
         // transaction rolls back, the PG decrement is undone automatically,
-        // and we throw to the outer catch — no manual compensation needed.
+        // and we throw to the outer catch. No Redis writes happen here, so
+        // nothing needs manual compensation on rollback.
         try {
           await manager.query(
             `INSERT INTO "orders" ("id", "userId", "productId", "status", "failureReason", "createdAt", "updatedAt")
              VALUES (gen_random_uuid(), $1, $2, $3, NULL, now(), now())`,
             [userId, productId, 'SUCCESS'],
           );
-          orderInserted = true;
         } catch (insertErr) {
           const isUniqueViolation =
             insertErr instanceof QueryFailedError &&
@@ -162,26 +134,33 @@ export class OrdersProcessor extends WorkerHost {
         }
       }); // COMMIT here - row lock released, changes visible.
 
-      // Post-commit: idempotency marker is already set in-tx (Fix 3), so
-      // nothing to do here. Defense-in-depth re-check at the top of this
-      // method catches the rare case where a duplicate request slipped past
-      // the API fast-fail (e.g., cross-instance propagation delay).
+      // ------------------------------------------------------------------
+      // POST-COMMIT: the DB state is now durable. Only at this point do we
+      // write Redis flags, so Redis can never claim an order was purchased
+      // (or that a product is sold out) when the DB rolled the change back.
+      // ------------------------------------------------------------------
+
+      // Idempotency marker: only a committed SUCCESS row may set this. A
+      // 23505 duplicate on a rolled-back tx will never reach this line, so
+      // the false-positive "blocked for 24h without a purchase" bug is gone.
+      await this.redis.set(purchasedKey, '1', 24 * 60 * 60);
+
+      // Sticky sold-out flag: only set when the committed decrement drove
+      // remainingStock to exactly 0. If the last item's transaction rolls
+      // back, this is never set — the product is NOT falsely sold out.
+      if (remainingStock - 1 === 0) {
+        await this.redis.set(soldOutKey, '1', 24 * 60 * 60);
+      }
 
       this.logger.info(logCtx, 'order processed successfully');
       return { ok: true };
     } catch (err) {
       // The pessimistic transaction handles all rollback automatically:
-      // - OUT_OF_STOCK: no PG change (we threw before UPDATE). Fix 4 removed
-      //   the FAILED audit-row write — it added load with no integrity benefit.
+      // - OUT_OF_STOCK / PRODUCT_NOT_FOUND: no PG change (we threw before UPDATE).
       // - 23505 / transient errors: whole transaction rolled back; PG and
-      //   Redis stock are unchanged. Note: with Fix 3, purchasedKey was set
-      //   before INSERT, so on 23505 it stays in Redis briefly (false-positive
-      //   idempotency lock for this user-product). Acceptable trade-off.
-      //
-      // pgDecremented/orderInserted may both be false here (transaction
-      // rolled back before commit) or one true / one false (we threw mid-tx).
-      // In neither case do we need to issue a compensating UPDATE — PG has
-      // already done it atomically.
+      //   Redis stock are unchanged. Because no Redis flags are written in-tx,
+      //   there is no compensation needed here — Redis and the DB stay
+      //   consistent by construction.
       throw err;
     } finally {
       // Best-effort lock release. If the API was a no-op (Lua returned OK
