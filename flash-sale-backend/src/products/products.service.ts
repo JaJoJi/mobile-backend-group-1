@@ -11,6 +11,7 @@ export interface ProductStaticRecord {
   description: string | null;
   price: number;
   availableStock: number;
+  remainingStock?: number;
   isFlashSaleActive: boolean;
 }
 
@@ -244,9 +245,28 @@ export class ProductsService {
     }
   }
 
+  // On a Redis cache miss, return the LIVE remaining stock, never the initial
+  // total. Preference order:
+  //   1. record.remainingStock (the live value maintained by the worker's
+  //      pessimistic PG transaction)
+  //   2. fallback (the already-cached stock fragment, if any)
+  //   3. record.availableStock (initial total) as a last resort
   private extractStock(record: ProductStaticRecord | undefined, fallback: number | undefined): number | null {
     if (record && typeof record === 'object') {
-      return Number(record?.availableStock ?? record?.['remainingStock'] ?? fallback ?? 0);
+      const remaining = Number(record.remainingStock ?? record['remainingStock'] ?? NaN);
+      if (Number.isFinite(remaining) && remaining >= 0) {
+        return remaining;
+      }
+
+      const fallbackValue = Number(fallback ?? NaN);
+      if (Number.isFinite(fallbackValue) && fallbackValue >= 0) {
+        return fallbackValue;
+      }
+
+      const total = Number(record.availableStock ?? NaN);
+      if (Number.isFinite(total) && total >= 0) {
+        return total;
+      }
     }
 
     if (fallback != null) {

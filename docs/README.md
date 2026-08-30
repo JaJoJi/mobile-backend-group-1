@@ -1,5 +1,61 @@
 # Flash Sale System Architecture Summary
 
+## System Flow at a Glance
+
+```mermaid
+flowchart LR
+    Client["Client / k6"] -->|"HTTP (stateless)"| Nginx["Nginx<br/>least_conn"]
+    Nginx -->|"round-robin"| API1["NestJS nest-1"]
+    Nginx --> API2["NestJS nest-2..6"]
+
+    subgraph "Application (6 stateless instances)"
+        API1
+        API2
+    end
+
+    API1 & API2 --> Redis[("Redis :6379<br/>cache · Lua · BullMQ")]
+    API1 & API2 --> PGReplica[("PostgreSQL Replica :5433<br/>reads")]
+
+    Redis -->|"BullMQ jobs"| Worker["OrdersProcessor<br/>concurrency: 2"]
+    Worker --> PGPrimary[("PostgreSQL Primary :5432<br/>writes")]
+    PGPrimary -->|"streaming replication (WAL)"| PGReplica
+```
+
+### Read path (GET /products — cache-aside + lazy hydration)
+
+```mermaid
+flowchart TD
+    A["GET /api/v1/products"] --> B{"products:id_list<br/>exists?"}
+    B -- "no" --> C["rebuild index from PG"]
+    C --> D["LRANGE page IDs"]
+    B -- "yes" --> D
+    D --> E["MGET static + stock fragments"]
+    E --> F{"fragments<br/>complete?"}
+    F -- "yes" --> G["serve from Redis<br/>record cache hit"]
+    F -- "no" --> H["loadMissingProducts<br/>(single-flight dedup)"]
+    H --> I["SELECT products.remainingStock<br/>FROM replica"]
+    I --> J["extractStock:<br/>prefer live remainingStock"]
+    J --> K["MSET static + stock back"]
+    K --> G
+```
+
+### Write path (POST /orders — fast-fail → worker → compensation)
+
+```mermaid
+flowchart TD
+    A["POST /api/v1/orders"] --> B["Lua fast-fail<br/>checks + DECR stock"]
+    B -- "reject" --> R["409 / 429"]
+    B -- "ok" --> C["enqueue BullMQ job"]
+    C --> D["Worker pessimistic tx<br/>SELECT ... FOR UPDATE"]
+    D --> E{"remainingStock<br/>&gt; 0?"}
+    E -- "no" --> F["OUT_OF_STOCK<br/>rollback (no compensation)"]
+    E -- "yes" --> G["UPDATE decrement + INSERT order"]
+    G --> H{"COMMIT<br/>ok?"}
+    H -- "yes" --> I["SUCCESS<br/>set sold-out flag if 0"]
+    H -- "no" --> J["`failed` event<br/>(after all retries)"]
+    J --> K["compensateFailedStock<br/>INCR once (marker key)"]
+```
+
 ## 1. High-Level Architecture Overview
 
 This backend is designed for a flash-sale workload where demand spikes to thousands of requests per second and the safe path is determined by Redis-first validation rather than expensive PostgreSQL reads or writes on the request hot path.
@@ -77,10 +133,10 @@ The system uses 11 Redis keys/patterns for the flash-sale orchestration layer. E
 |---|---|---|---|---|---|
 | 1 | `products:id_list` | List | 1 hour | `BootstrapperService`, `ProductsService` | Active flash-sale product ID index used for paginated product reads and startup warm-up. |
 | 2 | `product:static:{productId}` | String (JSON) | 24 hours | `ProductsService` | Immutable product details fragment, including name, description, price, and flash-sale flags. |
-| 3 | `stock:{productId}` | String (integer) | 24 hours | `OrdersService`, `ProductsService` | Atomic inventory counter used for reservation and oversell prevention. |
+| 3 | `stock:{productId}` | String (integer) | 1 hour | `OrdersService`, `ProductsService` | Atomic inventory counter used for reservation and oversell prevention. DECR'd at the API layer; self-heals via hydration. |
 | 4 | `product:soldout:{productId}` | String flag | 24 hours | `OrdersService` | Fast-fail flag for exhausted products; prevents further order attempts after oversubscription. |
 | 5 | `order:purchased:{userId}:{productId}` | String flag | 24 hours | `OrdersService`, `OrdersProcessor` | Idempotency marker preventing the same user from purchasing the same product twice. |
-| 6 | `order:lock:{userId}:{productId}` | String lock value | 30 seconds | `OrdersService`, `OrdersProcessor` | Distributed lock to serialize concurrent user/product order requests. |
+| 6 | `order:lock:{userId}:{productId}` | String lock value | 60 seconds | `OrdersService`, `OrdersProcessor` | Distributed lock to serialize concurrent user/product order requests. |
 | 7 | `products:id_list:warmup_lock` | String lock | 30 seconds | `BootstrapperService` | Singleton startup lock that prevents duplicate warm-up attempts across app instances. |
 | 8 | `products:id_list:rebuild_lock` | String lock | 10 seconds | `ProductsService` | Concurrency control during index rebuilds when the Redis list is empty or missing. |
 | 9 | `cache:hits:products` | Counter | No TTL | `ProductsService`, `RedisService` | Atomic success counter for product-fragment cache hits. |
@@ -198,6 +254,118 @@ The system treats job failures as data integrity events rather than silent recov
 - if the failure is transient, it is surfaced as a real job failure instead of being misclassified as a duplicate purchase
 
 This makes the overall architecture resilient: the API remains fast, Redis remains the primary guardrail, and the async worker performs the expensive but reliable write operations without polluting the hot request path.
+
+---
+
+## 5. Inventory Correctness Fixes (Hydration & Counter Drift)
+
+### 5.1 Bug 1 — Read-path hydration returned initial stock instead of live stock
+
+**Root cause:** `ProductsService.extractStock()` returned
+`record.availableStock ?? record.remainingStock ?? fallback ?? 0`. Because
+`availableStock` (the initial total) is always populated, the `remainingStock`
+branch was effectively dead code — so a Redis cache miss rehydrated the stock
+counter with the **initial total** rather than the live remaining value. Under
+high concurrency this reintroduced oversell risk.
+
+**Fix:** `extractStock()` now prefers the live value in this order:
+
+1. `record.remainingStock` (maintained by the worker's pessimistic PG transaction)
+2. `fallback` (the already-cached stock fragment, if any)
+3. `record.availableStock` (initial total) — last resort only
+
+```ts
+private extractStock(record, fallback): number | null {
+  if (record && typeof record === 'object') {
+    const remaining = Number(record.remainingStock ?? record['remainingStock'] ?? NaN);
+    if (Number.isFinite(remaining) && remaining >= 0) return remaining;
+
+    const fallbackValue = Number(fallback ?? NaN);
+    if (Number.isFinite(fallbackValue) && fallbackValue >= 0) return fallbackValue;
+
+    const total = Number(record.availableStock ?? NaN);
+    if (Number.isFinite(total) && total >= 0) return total;
+  }
+  if (fallback != null) return Number(fallback);
+  return null;
+}
+```
+
+`fetchMissingProductsFromDb()` already selects `remainingStock` and writes it
+back via `stockValue = Number(row.remainingStock ?? row.availableStock ?? 0)` —
+only `extractStock` was discarding the live value. The rehydrated Redis value now
+matches the PostgreSQL source of truth.
+
+### 5.2 Bug 2 — Redis counter drift on worker failure (ghost sold-out)
+
+**Root cause:** the API's Lua fast-fail `DECR`s `stock:{id}` *before* enqueueing.
+If the worker later failed (rollback, validation error, crash), there was no
+compensating `INCR`, so Redis drifted permanently below PostgreSQL and made items
+appear sold out despite available DB stock.
+
+**Fix:** two coordinated changes:
+
+**a) `RedisService.compensateFailedStock()`** — an idempotent one-time `INCR`
+guarded by an `NX` marker key:
+
+```ts
+async compensateFailedStock(stockKey, restoreKey, ttlSeconds = 24 * 60 * 60): Promise<number> {
+  const script = `
+    if redis.call('SET', KEYS[2], '1', 'NX', 'EX', ARGV[1]) then
+      return redis.call('INCR', KEYS[1])
+    end
+    return 0
+  `;
+  const result = (await this.client.eval(script, 2, stockKey, restoreKey, String(ttlSeconds))) as unknown;
+  return Number(result ?? 0);
+}
+```
+
+The marker key (`restoreKey`) makes the increment happen **exactly once** per
+failed job, even across retries, duplicate `failed` events, or cross-instance
+races.
+
+**b) `OrdersProcessor.onJobFailed()`** — hooked to the BullMQ `failed` event,
+which fires **once per job after all `attempts` are exhausted** (not per attempt,
+which would over-compensate if a retry later succeeded):
+
+```ts
+@OnWorkerEvent('failed')
+async onJobFailed(job: Job<OrderJobData>, error: Error): Promise<void> {
+  const { userId, productId } = job.data;
+  const stockKey = `stock:${productId}`;
+  const restoreKey = `order:stock:restore:${job.id ?? `${userId}:${productId}`}`;
+
+  // OUT_OF_STOCK: PG was already zero before the job ran, so there is nothing
+  // to compensate — and the worker already set the sticky sold-out flag.
+  // Restoring here would push Redis above zero and defeat the sold-out fast-fail.
+  if (error?.message === 'OUT_OF_STOCK') {
+    this.logger.warn({ jobId: job.id, userId, productId }, 'job failed with OUT_OF_STOCK; skipping stock compensation');
+    return;
+  }
+
+  const restored = await this.redis.compensateFailedStock(stockKey, restoreKey, 24 * 60 * 60);
+  if (restored > 0) {
+    this.logger.warn({ jobId: job.id, userId, productId, restoredTo: restored }, 'compensated Redis stock for failed order job');
+  }
+}
+```
+
+**Why `failed` event, not the `process()` catch:** the queue uses `attempts: 2`.
+Compensating in `process()`'s catch would `INCR` on every retry attempt and
+double-restore if a later retry succeeded. The `failed` event fires exactly once
+after all attempts are exhausted, making the compensation semantically correct.
+
+**Why skip `OUT_OF_STOCK`:** when PostgreSQL is already at zero there is no rolled
+back decrement to compensate, and the in-tx logic has already set the sticky
+sold-out flag. Compensating here would push Redis back above zero and flood the
+queue with wasted jobs.
+
+### 5.3 Verification strategy
+
+1. **Hydration:** assert `extractStock({ availableStock: 100, remainingStock: 37 }) === 37`, and that `availableStock` is only used when `remainingStock` is absent.
+2. **Compensation idempotency:** after a simulated `DECR` (10 → 9) and worker failure, assert `compensateFailedStock` returns `10` on the first call and `0` on the second, leaving the counter at `10`.
+3. **Failure integration:** force a worker failure (e.g. `23505` duplicate rollback after a successful `DECR`), confirm the `failed` log line and that `stock:{id}` in Redis equals `remainingStock` in PostgreSQL, with repeated `failed` events not inflating the counter.
 
 ---
 
