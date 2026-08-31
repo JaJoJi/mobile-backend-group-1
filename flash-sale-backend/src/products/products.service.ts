@@ -35,26 +35,39 @@ export class ProductsService {
   ) { }
 
   async findAll(page: number, limit: number) {
-    await this.ensureActiveProductIdIndex();
-
-    const listKey = 'products:id_list';
+    const listKey = ProductsService.INDEX_KEY;
     const start = (page - 1) * limit;
     const stop = start + limit - 1;
 
+    // Single parallel round-trip for IDs and Total count
     const [ids, total] = await Promise.all([
       this.redis.lrange(listKey, start, stop),
       this.redis.llen(listKey),
     ]);
 
+    // Rebuild index only if Redis cache is cold
+    if (total === 0) {
+      await this.ensureActiveProductIdIndex();
+      const [rebuiltIds, rebuiltTotal] = await Promise.all([
+        this.redis.lrange(listKey, start, stop),
+        this.redis.llen(listKey),
+      ]);
+      return this.processProductsList(rebuiltIds, rebuiltTotal, page, limit);
+    }
+
+    return this.processProductsList(ids, total, page, limit);
+  }
+
+  private async processProductsList(ids: string[], total: number, page: number, limit: number) {
     if (ids.length === 0) {
       const emptyResult = {
         status: 'success',
         data: [],
         meta: {
-          total: 0,
+          total,
           page,
           limit,
-          totalPages: 0,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
         },
       };
       return emptyResult;
@@ -63,10 +76,11 @@ export class ProductsService {
     const detailKeys = ids.map((id) => this.staticKey(id));
     const stockKeys = ids.map((id) => this.stockKey(id));
 
-    const [detailValues, stockValues] = await Promise.all([
-      this.redis.mgetStrings(detailKeys),
-      this.redis.mgetStrings(stockKeys),
-    ]);
+    // Batch all keys into 1 single Redis MGET query
+    const allKeys = [...detailKeys, ...stockKeys];
+    const allValues = await this.redis.mgetStrings(allKeys);
+    const detailValues = allValues.slice(0, ids.length);
+    const stockValues = allValues.slice(ids.length);
 
     const detailMap = new Map<string, ProductStaticRecord>();
     const stockMap = new Map<string, number>();
