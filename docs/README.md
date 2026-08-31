@@ -16,7 +16,7 @@ flowchart LR
     API1 & API2 --> Redis[("Redis :6379<br/>cache · Lua · BullMQ")]
     API1 & API2 --> PGReplica[("PostgreSQL Replica :5433<br/>reads")]
 
-    Redis -->|"BullMQ jobs"| Worker["OrdersProcessor<br/>concurrency: 4"]
+    Redis -->|"BullMQ jobs"| Worker["OrdersProcessor<br/>concurrency: 2"]
     Worker --> PGPrimary[("PostgreSQL Primary :5432<br/>writes")]
     PGPrimary -->|"streaming replication (WAL)"| PGReplica
 ```
