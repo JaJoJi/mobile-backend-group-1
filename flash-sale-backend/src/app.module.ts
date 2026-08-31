@@ -9,6 +9,7 @@ import { HealthModule } from './health/health.module';
 import { OrdersModule } from './orders/orders.module';
 import { ProductsModule } from './products/products.module';
 import { QueueModule } from './queue/queue.module';
+import { BootstrapperModule } from './bootstrap/bootstrapper.module';
 
 @Module({
   imports: [
@@ -55,6 +56,7 @@ import { QueueModule } from './queue/queue.module';
     QueueModule,
     AuthModule,
     HealthModule,
+    BootstrapperModule,
     ProductsModule,
     OrdersModule,
   ],
