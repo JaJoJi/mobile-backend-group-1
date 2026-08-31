@@ -31,12 +31,10 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         synchronize: false,
         migrationsRun: true,
         migrations: ['dist/database/migrations/*.js'],
-        // Re-enable for diagnostic
-        logging: ['query', 'error'],
-        logger: 'advanced-console',
+        logging: ['error'],
         extra: {
-          max: 100,
-          min: 10,
+          max: 300,
+          min: 20,
           idleTimeoutMillis: 30_000,
           connectionTimeoutMillis: 5_000,
         },
