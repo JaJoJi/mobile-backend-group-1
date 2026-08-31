@@ -31,15 +31,11 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         synchronize: false,
         migrationsRun: true,
         migrations: ['dist/database/migrations/*.js'],
-        // Logging disabled to keep event loop free at high RPS.
-        // Each PG query used to be serialized to Pino — at 6k+ req/s
-        // this saturated I/O and was a major contributor to infra failures.
-        logging: false,
+        // Re-enable for diagnostic
+        logging: ['query', 'error'],
         logger: 'advanced-console',
         extra: {
-          // 6 instances * 80 = 480 < PG max_connections (1000),
-          // leaving headroom for replica reads, healthchecks, and admin.
-          max: 80,
+          max: 100,
           min: 10,
           idleTimeoutMillis: 30_000,
           connectionTimeoutMillis: 5_000,

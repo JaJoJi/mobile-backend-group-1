@@ -14,7 +14,7 @@ services:
       POSTGRESQL_DATABASE: flashsale
       POSTGRESQL_REPLICATION_USER: repl
       POSTGRESQL_REPLICATION_PASSWORD: repl123
-      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=1000"
+      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=600"
     volumes:
       - pg-primary-data:/bitnami/postgresql
     ports:
@@ -33,7 +33,7 @@ services:
       POSTGRESQL_USERNAME: app
       POSTGRESQL_PASSWORD: app123
       POSTGRESQL_DATABASE: flashsale
-      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=1000"
+      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=600"
     volumes:
       - pg-replica-data:/bitnami/postgresql
     ports:

@@ -23,7 +23,7 @@ interface OrderJobData {
 // BullMQ worker responsive but long enough to absorb a single hot row.
 const PG_LOCK_TIMEOUT_MS = 2000;
 
-@Processor('orders', { concurrency: 20 })
+@Processor('orders', { concurrency: 2 })
 export class OrdersProcessor extends WorkerHost {
   constructor(
     @InjectRepository(Product) private readonly productRepo: Repository<Product>,
