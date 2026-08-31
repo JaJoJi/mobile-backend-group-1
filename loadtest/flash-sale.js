@@ -504,6 +504,7 @@ export function handleSummary(data) {
 
   return {
     stdout: '\n' + banner + '\n\n' + textSummary(data, { indent: ' ', enableColors: true }),
+    'loadtest/results/summary.json':   JSON.stringify(data, null, 2),
     'loadtest/results/business.txt':   businessTxt,
   };
 }

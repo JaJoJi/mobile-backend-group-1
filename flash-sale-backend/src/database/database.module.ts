@@ -37,9 +37,9 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         logging: false,
         logger: 'advanced-console',
         extra: {
-          // 6 instances * 100 = 600 < PG max_connections (1000),
+          // 6 instances * 80 = 480 < PG max_connections (1000),
           // leaving headroom for replica reads, healthchecks, and admin.
-          max: 100,
+          max: 80,
           min: 10,
           idleTimeoutMillis: 30_000,
           connectionTimeoutMillis: 5_000,
