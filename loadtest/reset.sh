@@ -59,6 +59,8 @@ PSQL_CMD=(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SEED_FILE="$SCRIPT_DIR/../products-seed.json"
 
+# k6 handleSummary writes here but does NOT auto-create directories on
+# Windows; create early so summary.json and business.txt never fail.
 mkdir -p "$SCRIPT_DIR/results"
 
 if [ ! -f "$SEED_FILE" ]; then
