@@ -20,9 +20,6 @@ import { RedisService } from './redis.service';
           // reads, this turns N round-trips into ~1, cutting Redis latency
           // dramatically under flash-sale load.
           enableAutoPipelining: true,
-          // Cap pipeline size to avoid massive single responses; 100 is
-          // a safe default that still gives ~10x reduction in round-trips.
-          pipelineLimit: 100,
         }),
     },
     RedisService,
