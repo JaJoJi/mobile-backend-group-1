@@ -264,38 +264,6 @@ export class RedisService {
     return this.client.incr(stockKey);
   }
 
-  // One-time compensating INCR for a DECR that was performed by the API's Lua
-  // fast-fail but whose queued job ultimately FAILED to materialize an order in
-  // PostgreSQL (worker rollback, validation failure, crash, etc.).
-  //
-  // Idempotency: guarded by a compensation marker key (restoreKey) that is SET
-  // NX with a TTL. Only the first caller actually performs the INCR; subsequent
-  // calls (retries, duplicate `failed` events, cross-instance races) see the
-  // marker already set and return 0 without touching the counter. This prevents
-  // ghost stock inflation when the same failure is observed more than once.
-  async compensateFailedStock(
-    stockKey: string,
-    restoreKey: string,
-    ttlSeconds = 24 * 60 * 60,
-  ): Promise<number> {
-    const script = `
-      if redis.call('SET', KEYS[2], '1', 'NX', 'EX', ARGV[1]) then
-        return redis.call('INCR', KEYS[1])
-      end
-      return 0
-    `;
-
-    const result = (await this.client.eval(
-      script,
-      2,
-      stockKey,
-      restoreKey,
-      String(ttlSeconds),
-    )) as unknown;
-
-    return Number(result ?? 0);
-  }
-
   private serialize(value: unknown): string {
     if (typeof value === 'string') return value;
     return JSON.stringify(value);
