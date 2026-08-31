@@ -19,11 +19,17 @@ interface OrderJobData {
 
 // Pessimistic-lock timeout per transaction. Workers contending on the same
 // product row will wait this long before PostgreSQL aborts the lock attempt
-// with error code 55P03 (lock_not_available). 2s is short enough to keep the
-// BullMQ worker responsive but long enough to absorb a single hot row.
-const PG_LOCK_TIMEOUT_MS = 2000;
+// with error code 55P03 (lock_not_available). 5s lets workers absorb a hot
+// row without triggering retries; shorter values cause retry storms under
+// high contention for one product.
+const PG_LOCK_TIMEOUT_MS = 5000;
 
-@Processor('orders', { concurrency: 20 })
+// Worker concurrency is intentionally LOW for this workload: every job for
+// the flash-sale target (p-1001) serializes on a single row lock, so a
+// larger pool just queues up 55P03 lock_not_available errors instead of
+// processing faster. 5 per instance × 6 instances = 30 workers, enough
+// headroom without lock-thrashing.
+@Processor('orders', { concurrency: 5 })
 export class OrdersProcessor extends WorkerHost {
   constructor(
     @InjectRepository(Product) private readonly productRepo: Repository<Product>,

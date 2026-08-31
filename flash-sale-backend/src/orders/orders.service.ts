@@ -97,7 +97,12 @@ export class OrdersService {
         {
           removeOnComplete: 1000,
           removeOnFail: 1000,
-          attempts: 2,
+          // attempts=1: retrying OUT_OF_STOCK or ALREADY_PURCHASED just
+          // wastes a worker slot — these failures are deterministic.
+          // Transient failures (lock timeout, deadlock) are recovered
+          // by the worker's pessimistic tx rolling back; the client can
+          // re-submit via the API layer if needed.
+          attempts: 1,
           backoff: {
             type: 'fixed',
             delay: 250,
