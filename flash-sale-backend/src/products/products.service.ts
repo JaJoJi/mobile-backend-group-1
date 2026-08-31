@@ -423,17 +423,17 @@ export class ProductsService {
         ttlSeconds: 24 * 60 * 60,
       });
 
-      // stock:{id} uses a 1-hour TTL. The DECR-by-API overflow counter must
+      // stock:{id} uses a 10-minute TTL. The DECR-by-API overflow counter must
       // remain authoritative for the entire flash sale duration (typically
       // <1h). A short TTL (e.g. 30s) caused cold-start bypass during the
       // k6 40s test: once stockKey TTL expired mid-test, Lua saw stockVal=nil
       // and skipped DECR entirely, letting thousands of overflow requests
-      // through to the queue. 1h TTL keeps the counter alive throughout the
-      // sale; it self-heals on next hydration if PG ever drifts.
+      // through to the queue. The 10-minute TTL keeps the counter alive across
+      // brief outages; it self-heals on next hydration if PG ever drifts.
       writeBack.push({
         key: this.stockKey(row.productId),
         value: stockValue,
-        ttlSeconds: 60 * 60,
+        ttlSeconds: 60 * 10,
       });
 
       // Sync the sticky sold-out flag if PG confirms remainingStock=0, so
