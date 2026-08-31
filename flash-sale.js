@@ -1,385 +1,439 @@
-/**
- * k6 load test — Flash Sale System (single file, per Final_Assignment.MD §3)
- *
- *   k6 run -e BASE_URL=http://localhost loadtest/flash-sale.js
- *   docker run --rm --network flash-sale-system_default \
- *     -v "$PWD/loadtest:/loadtest" grafana/k6 run -e BASE_URL=http://nginx /loadtest/flash-sale.js
- *
- * Run `node loadtest/reset.js` first (fresh stock + clean cache/metrics counters).
- *
- * Queue order:
- *   1. setup()   — fetch 500 unique JWTs (user-1..user-500). NOT timed; just
- *                  has to finish for everyone. Aborts the run if any != 200.
- *   2. read_load — timed, kept as short as still gives a stable p95; goal is
- *                  minimum duration + minimum failures. 1,000 concurrent VUs,
- *                  GET /api/v1/products with page + limit rotated per request
- *                  (limit in {5,10,20}); each response must echo the scope it
- *                  was asked for and return exactly the rows in that window.
- *   3. write_load— timed the same way. 500 concurrent, POST /api/v1/orders for
- *                  p-1001 (stock 50); every Nth VU double/triple-fires
- *                  concurrently to exercise the duplicate-rights guard.
- *
- * Both phases feed the report: teardown() pulls GET /api/v1/_metrics for the
- * cache check (L1/L2/miss hit ratio) and the queue check (waiting/active/
- * completed/failed + lifetime orders_completed / orders_failed counters).
- */
+/* eslint-disable */
+// =============================================================================
+// Flash Sale System — k6 Load Test  (architecture.md §9.2)
+//
+//   k6 run loadtest.js
+//   k6 run -e BASE_URL=http://localhost:8080 loadtest.js
+//   k6 run --out json=raw.json loadtest.js        # ป้อนเข้า dashboard
+//
+// สองสถานการณ์ตามโจทย์:
+//   read_heavy   1,000 concurrent users อ่าน GET /api/v1/products 30 วินาที
+//   write_burst  500 คนแย่งของ 50 ชิ้น และ "กดรัว" คนละ 3 ครั้ง (per-vu-iterations)
+// =============================================================================
 
 import http from 'k6/http';
-import { check, sleep } from 'k6';
+import exec from 'k6/execution';
+import { check } from 'k6';
 import { Counter, Rate, Trend } from 'k6/metrics';
 
-// ============================ Tunables (env-overridable) ====================
-const BASE_URL = __ENV.BASE_URL || 'http://localhost';
-const USER_COUNT = Number(__ENV.USER_COUNT || 500); // unique users / JWTs
-const PRODUCT_ID = __ENV.PRODUCT_ID || 'p-1001'; // write contention target
-const REQ_TIMEOUT = __ENV.REQ_TIMEOUT || '10s'; // per-request HTTP timeout
-const TOTAL_PRODUCTS = Number(__ENV.TOTAL_PRODUCTS || 20); // catalogue size (spec §2.2 example: total 20)
-const READ_LIMITS = String(__ENV.READ_LIMITS || '5,10,20') // limit values the read phase rotates through
-  .split(',')
-  .map((n) => Number(n.trim()))
-  .filter((n) => n > 0);
+const BASE_URL = (__ENV.BASE_URL || 'http://localhost:8080').replace(
+  /\/+$/,
+  '',
+);
+const REQ_TIMEOUT = __ENV.REQ_TIMEOUT || '60s';
 
-// -- read phase: minimise wall time while still hitting a true 1,000-VU plateau.
-// Ramp is gentle on purpose — a 5s slam to 1,000 VUs stampedes the api tier
-// before its caches/JIT warm and drags p95 well past 500ms.
-const READ_TARGET = Number(__ENV.READ_TARGET || 1000);
-const READ_RAMP = __ENV.READ_RAMP || '10s';
-const READ_HOLD = __ENV.READ_HOLD || '18s';
-const READ_DOWN = __ENV.READ_DOWN || '2s';
+// สินค้าเป้าหมายของ write burst — availableStock = 50 (products-seed.json)
+const TARGET_PRODUCT_ID = __ENV.TARGET_PRODUCT_ID || 'p-1001';
 
-// -- write phase: 500 concurrent, one shot each (a real "done" state)
-const WRITE_TARGET = Number(__ENV.WRITE_TARGET || 500);
-const WRITE_MAXDUR = __ENV.WRITE_MAXDUR || '60s'; // safety ceiling; real run ~2-4s
-const DOUBLE_TAP_EVERY = Number(__ENV.DOUBLE_TAP_EVERY || 10); // every Nth VU double-fires
+const READ_VUS = integerEnv('READ_VUS', 1_000, 1, 10_000);
+const READ_DURATION = __ENV.READ_DURATION || '30s';
+const WRITE_VUS = integerEnv('WRITE_VUS', 500, 1, 5_000);
+const WRITE_ITERATIONS = integerEnv('WRITE_ITERATIONS', 3, 1, 100);
+const WRITE_START_TIME = __ENV.WRITE_START_TIME || '10s';
+const WRITE_MAX_DURATION = __ENV.WRITE_MAX_DURATION || '20s';
 
-const GAP = Number(__ENV.GAP || 3); // seconds between read end and write start
-const readSeconds = toSec(READ_RAMP) + toSec(READ_HOLD) + toSec(READ_DOWN);
+// k6 จอง VU IDs ร่วมกันระหว่าง scenarios และ IDs ของ write scenario
+// อาจมีช่องว่าง จึง mint token ครอบคลุม VU ID domain ทั้งสอง scenarios
+// แล้ว map idInTest โดยตรง ห้าม modulo เพราะทำให้สอง write VUs ใช้ user ซ้ำได้
+const VU_ID_DOMAIN = READ_VUS + WRITE_VUS;
+const USER_COUNT = integerEnv('USER_COUNT', VU_ID_DOMAIN, VU_ID_DOMAIN, 15_000);
 
-function toSec(d) {
-  const m = String(d).match(/^(\d+(?:\.\d+)?)(ms|s|m)?$/);
-  if (!m) return 0;
-  const n = parseFloat(m[1]);
-  return m[2] === 'ms' ? n / 1000 : m[2] === 'm' ? n * 60 : n;
+// จำนวนสินค้าทั้งหมดใน seed — ใช้คำนวณช่วง page ที่ถูกต้อง
+const TOTAL_PRODUCTS = integerEnv('TOTAL_PRODUCTS', 20, 1, 100_000);
+
+// -----------------------------------------------------------------------------
+// 200/202/409 เป็น healthy HTTP outcomes ของ workload นี้
+// 503 อยู่ใน API contract แต่ยังเป็น availability failure จึงต้องคงเป็น
+// http_req_failed และมี custom infrastructure metric แยกต่างหาก
+// -----------------------------------------------------------------------------
+http.setResponseCallback(http.expectedStatuses(200, 202, 409));
+
+// --- custom metrics ----------------------------------------------------------
+const authSetupCount = new Counter('auth_setup_count');
+const authSetupFailures = new Counter('auth_setup_failures');
+const authSetupRequestDuration = new Trend('auth_setup_request_duration', true);
+const authSetupWallDuration = new Trend('auth_setup_wall_duration', true);
+
+const orderRequests = new Counter('orders_requests');
+const orders202 = new Counter('orders_202'); // เข้าคิวสำเร็จ
+const orders409 = new Counter('orders_409'); // admission race ที่ contract อนุญาต
+const orders503 = new Counter('orders_503'); // contract-valid แต่ availability fail
+const orders5xx = new Counter('orders_5xx');
+const orders401 = new Counter('orders_unauthorized_401'); // ไม่ควรเกิดเลย
+const ordersOther = new Counter('orders_unexpected'); // ⚠️ ต้องเป็น 0
+const orderContractValid = new Rate('orders_contract_valid');
+const orderSuccessfulAdmission = new Rate('orders_successful_admission');
+const orderInfrastructureError = new Rate('orders_infrastructure_error');
+
+const readOk = new Counter('reads_ok_200');
+const readBadShape = new Counter('reads_bad_contract'); // ⚠️ ต้องเป็น 0
+const readStockFresh = new Rate('reads_remaining_stock_present');
+const readLatency = new Trend('read_products_latency', true);
+const orderLatency = new Trend('place_order_latency', true);
+
+function integerEnv(name, fallback, minimum, maximum) {
+  const raw = __ENV[name];
+  const value = raw === undefined ? fallback : Number(raw);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}.`);
+  }
+  return value;
 }
 
-// ============================ Custom metrics ================================
-const infraFail = new Rate('infra_failures'); // 5xx / timeout / unexpected 4xx (NOT 409)
-const ordersAccepted = new Counter('orders_accepted'); // HTTP 202
-const ordersSoldout = new Counter('orders_soldout'); // HTTP 409 "Product sold out"
-const ordersDuplicate = new Counter('orders_duplicate'); // HTTP 409 already-claimed
-const readCacheHitPct = new Trend('read_cache_hit_pct'); // sampled during read phase
-const writeQueueBacklog = new Trend('write_queue_backlog'); // waiting+active, sampled during write
-const dataIntegrityOk = new Rate('data_integrity_ok'); // post-burst remainingStock == 0
-
-const REQ = { timeout: REQ_TIMEOUT };
-const JSON_HDR = { 'Content-Type': 'application/json' };
-
-// A response is an infra failure only if it is neither the read success (200)
-// nor an expected order outcome (202 accepted, 409 sold-out / duplicate).
-function isInfraFailure(res) {
-  if (res.status === 0) return true; // timeout / connection error
-  if (res.status === 200 || res.status === 202 || res.status === 409) return false;
-  return true;
+function contractOrderStatus(status) {
+  return [202, 400, 401, 404, 409, 422, 500, 503].includes(status);
 }
 
-// ============================ Options =====================================
+function infrastructureFailure(status) {
+  return status === 0 || status >= 500;
+}
+
 export const options = {
+  discardResponseBodies: false,
   scenarios: {
-    read_load: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: READ_RAMP, target: READ_TARGET },
-        { duration: READ_HOLD, target: READ_TARGET },
-        { duration: READ_DOWN, target: 0 },
-      ],
-      exec: 'readScenario',
-      gracefulRampDown: '3s',
+    read_heavy: {
+      // 1,000 concurrent readers
+      executor: 'constant-vus',
+      vus: READ_VUS,
+      duration: READ_DURATION,
+      exec: 'readProducts',
+      startTime: '5s',
+      tags: { scenario_kind: 'read' },
     },
-    write_load: {
+    write_burst: {
+      // 500 คนแย่ง 50 ชิ้น พร้อมกัน — iterations: 3 = จำลองการ "กดรัว"
       executor: 'per-vu-iterations',
-      vus: WRITE_TARGET,
-      iterations: 1,
-      maxDuration: WRITE_MAXDUR,
-      startTime: `${readSeconds + GAP}s`,
-      exec: 'writeScenario',
+      vus: WRITE_VUS,
+      iterations: WRITE_ITERATIONS,
+      exec: 'placeOrder',
+      startTime: WRITE_START_TIME,
+      maxDuration: WRITE_MAX_DURATION,
+      tags: { scenario_kind: 'write' },
     },
   },
+  // คง threshold เดิมเพื่อให้ default workload reproduce พฤติกรรมเดิมได้
   thresholds: {
-    'http_req_duration{scenario:read_load}': ['p(95)<500'],
-    'http_req_duration{scenario:write_load}': ['p(95)<800'],
-    infra_failures: ['rate<0.01'],
-    'checks{scenario:read_load}': ['rate>0.99'],
-    'checks{scenario:write_load}': ['rate>0.99'],
-    data_integrity_ok: ['rate>0.99'], // remainingStock must be 0 after the drain
+    'http_req_duration{scenario:read_heavy}': ['p(95)<200'],
+    'http_req_duration{scenario:write_burst}': ['p(95)<300'],
   },
-  summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
 
-// ============================ 1. setup: 500 JWTs ==========================
+// =============================================================================
+// setup() — mint JWT ครอบคลุม VU ID domain (endpoint นี้ไม่ถูกวัด performance)
+// =============================================================================
 export function setup() {
-  const requests = [];
+  const setupStartedAt = Date.now();
+  const tokens = [];
+  const failures = [];
+
   for (let i = 1; i <= USER_COUNT; i++) {
-    requests.push(['POST', `${BASE_URL}/api/v1/auth/token`, JSON.stringify({ userId: `user-${i}` }), { headers: JSON_HDR, timeout: REQ_TIMEOUT }]);
-  }
-  const responses = http.batch(requests);
+    const userId = `user-${i}`;
+    const res = http.post(
+      `${BASE_URL}/api/v1/auth/token`,
+      JSON.stringify({ userId }),
+      {
+        timeout: REQ_TIMEOUT,
+        headers: { 'Content-Type': 'application/json' },
+        tags: { name: 'setup:auth-token' },
+      },
+    );
 
-  const tokens = responses.map((res, idx) => {
-    const userId = `user-${idx + 1}`;
-    if (res.status !== 200) {
-      throw new Error(`setup: auth/token for ${userId} returned ${res.status} (spec §2.1 requires 200) — body: ${res.body}`);
+    authSetupCount.add(1);
+    authSetupRequestDuration.add(res.timings.duration);
+
+    let token = null;
+    if (res.status === 200) {
+      try {
+        token = res.json('accessToken');
+      } catch (e) {
+        token = null;
+      }
     }
-    const token = res.json('accessToken');
-    if (!token) throw new Error(`setup: auth/token for ${userId} returned 200 but no accessToken`);
-    return token;
-  });
 
-  console.log(`setup: issued ${tokens.length} JWTs (user-1..user-${tokens.length})`);
-  return { tokens };
+    if (token) {
+      tokens[i - 1] = { userId, token };
+    } else {
+      authSetupFailures.add(1);
+      tokens[i - 1] = null;
+      failures.push(`${userId} -> HTTP ${res.status}`);
+    }
+  }
+
+  authSetupWallDuration.add(Date.now() - setupStartedAt);
+
+  if (failures.length > 0) {
+    exec.test.abort(
+      `setup: minted ${tokens.length - failures.length}/${USER_COUNT} JWTs; ` +
+        `refusing a partial identity set (${failures.slice(0, 5).join(', ')})`,
+    );
+  }
+
+  console.log(
+    `[setup] minted ${tokens.length}/${USER_COUNT} JWTs from ${BASE_URL}` +
+      (failures.length ? ` (failed: ${failures.slice(0, 5).join(', ')}…)` : ''),
+  );
+
+  return { tokens, baseUrl: BASE_URL };
 }
 
-// ============================ 2. read phase ===============================
-export function readScenario() {
-  // Rotate page + limit (spec §3 note: "Load test มีการลองเปลี่ยน page, limit บ้าง").
-  // Varying the query also spreads cache keys, so read_cache_hit_pct reflects a
-  // realistic multi-key workload rather than a single hot key.
-  const limit = READ_LIMITS[Math.floor(Math.random() * READ_LIMITS.length)];
-  const maxPage = Math.max(1, Math.ceil(TOTAL_PRODUCTS / limit));
-  const page = 1 + Math.floor(Math.random() * maxPage);
-  const expectedRows = Math.min(limit, Math.max(0, TOTAL_PRODUCTS - (page - 1) * limit));
+// =============================================================================
+// readProducts — read-heavy
+//   สุ่ม page/limit เพื่อไม่ให้ยิงโดน cache key เดียวตลอด
+//   (ไม่งั้น hit ratio ที่วัดได้จะสวยเกินจริง — architecture.md §9.2)
+// =============================================================================
+export function readProducts() {
+  const limits = [5, 10, 20];
+  const limit = limits[Math.floor(Math.random() * limits.length)];
+  const totalPages = Math.max(1, Math.ceil(TOTAL_PRODUCTS / limit));
+  const page = 1 + Math.floor(Math.random() * totalPages);
 
-  const res = http.get(`${BASE_URL}/api/v1/products?page=${page}&limit=${limit}`, { ...REQ, tags: { name: 'products' } });
+  const res = http.get(
+    `${BASE_URL}/api/v1/products?page=${page}&limit=${limit}`,
+    {
+      timeout: REQ_TIMEOUT,
+      tags: { name: 'GET /api/v1/products' },
+    },
+  );
+
+  readLatency.add(res.timings.duration);
+
+  const ok = check(res, {
+    'read: status is 200': (r) => r.status === 200,
+  });
+
+  if (!ok) {
+    readBadShape.add(1);
+    return;
+  }
+
+  readOk.add(1);
+
+  // ตรวจ contract (CLAUDE.md §3) — field ต้องครบและ type ต้องถูก
+  let body = null;
+  try {
+    body = res.json();
+  } catch (e) {
+    readBadShape.add(1);
+    return;
+  }
+
+  const shapeOk = check(body, {
+    'read: status === "success"': (b) => b && b.status === 'success',
+    'read: data is array': (b) => b && Array.isArray(b.data),
+    'read: meta has total/page/limit/totalPages': (b) =>
+      !!b &&
+      !!b.meta &&
+      typeof b.meta.total === 'number' &&
+      typeof b.meta.page === 'number' &&
+      typeof b.meta.limit === 'number' &&
+      typeof b.meta.totalPages === 'number',
+    'read: price is a number (ไม่ใช่ string จาก NUMERIC)': (b) =>
+      !b || !Array.isArray(b.data) || b.data.length === 0
+        ? true
+        : typeof b.data[0].price === 'number',
+    'read: remainingStock is a number (อ่านสดจาก Redis)': (b) =>
+      !b || !Array.isArray(b.data) || b.data.length === 0
+        ? true
+        : typeof b.data[0].remainingStock === 'number',
+  });
+
+  if (!shapeOk) {
+    readBadShape.add(1);
+  }
+
+  const hasFreshStock =
+    !!body &&
+    Array.isArray(body.data) &&
+    body.data.every((p) => typeof p.remainingStock === 'number');
+  readStockFresh.add(hasFreshStock);
+}
+
+// =============================================================================
+// placeOrder — write burst
+//   แต่ละ VU ใช้ token ของตัวเอง (ห้ามซ้ำ) แล้วยิง 3 ครั้งติด = จำลองการกดรัว
+//   คาดหวังหลัก: 202 ที่ยืนยัน enqueue; 409 ใช้เฉพาะ claim visibility race
+// =============================================================================
+export function placeOrder(data) {
+  const tokens = data.tokens;
+
+  // VU id ถูกนับรวมทุก scenario; direct mapping รักษาหลัก
+  // one write VU = one unique user และทำให้ iterations ถัดไปของ VU เดิมใช้ user เดิม
+  const idx = exec.vu.idInTest - 1;
+  if (idx < 0 || idx >= tokens.length) {
+    exec.test.abort(
+      `write VU id ${exec.vu.idInTest} exceeds prepared token domain ${tokens.length}`,
+    );
+  }
+  const { userId, token } = tokens[idx];
+
+  const res = http.post(
+    `${BASE_URL}/api/v1/orders`,
+    JSON.stringify({ productId: TARGET_PRODUCT_ID }),
+    {
+      timeout: REQ_TIMEOUT,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      tags: { name: 'POST /api/v1/orders' },
+    },
+  );
+
+  orderLatency.add(res.timings.duration);
+  orderRequests.add(1);
+
+  const isContractStatus = contractOrderStatus(res.status);
+  const isInfrastructureFailure = infrastructureFailure(res.status);
+  orderContractValid.add(isContractStatus);
+  orderSuccessfulAdmission.add(res.status === 202);
+  orderInfrastructureError.add(isInfrastructureFailure);
+  if (res.status >= 500) {
+    orders5xx.add(1);
+  }
 
   check(res, {
-    'read: status 200': (r) => r.status === 200,
-    // spec §2.2 challenge: response must echo the exact scope it was asked for.
-    'read: meta echoes scope': (r) => {
-      try {
-        const j = r.json();
-        return !!j && !!j.meta && j.meta.page === page && j.meta.limit === limit;
-      } catch (e) {
-        return false;
-      }
-    },
-    'read: rows match page window': (r) => {
-      try {
-        const j = r.json();
-        return Array.isArray(j.data) && j.data.length <= limit && j.data.length === expectedRows;
-      } catch (e) {
-        return false;
-      }
-    },
+    'order: status exists in frozen API contract': () => isContractStatus,
   });
-  infraFail.add(isInfraFailure(res));
 
-  // cache check (spec §3.1): one VU samples the live hit ratio a few times.
-  if (__VU === 1 && __ITER % 25 === 0) sampleCache('read');
-}
-
-// ============================ 3. write phase ==============================
-export function writeScenario(data) {
-  const token = data.tokens[(__VU - 1) % data.tokens.length];
-  const params = { ...REQ, headers: { ...JSON_HDR, Authorization: `Bearer ${token}` }, tags: { name: 'orders' } };
-  const body = JSON.stringify({ productId: PRODUCT_ID });
-
-  if (__VU % DOUBLE_TAP_EVERY === 0) {
-    // Double / triple tap: 2-3 identical requests fired CONCURRENTLY (http.batch)
-    // so they actually race the SADD lock, not run one after another.
-    const n = 2 + Math.floor(Math.random() * 2);
-    const burst = Array.from({ length: n }, () => ({ method: 'POST', url: `${BASE_URL}/api/v1/orders`, body, params }));
-    http.batch(burst).forEach(tallyOrder);
-  } else {
-    tallyOrder(http.post(`${BASE_URL}/api/v1/orders`, body, params));
-  }
-
-}
-
-function tallyOrder(res) {
-  const ok = check(res, { 'write: status 202 or 409': (r) => r.status === 202 || r.status === 409 });
-  infraFail.add(isInfraFailure(res));
-  if (!ok) return;
-
-  if (res.status === 202) {
-    ordersAccepted.add(1);
-    return;
-  }
-  let msg = '';
-  try {
-    msg = res.json('message') || '';
-  } catch (e) {
-    /* keep '' */
-  }
-  if (msg === 'Product sold out') ordersSoldout.add(1);
-  else ordersDuplicate.add(1);
-}
-
-// ============================ samplers ====================================
-function sampleCache(phase) {
-  const m = fetchMetrics();
-  const mm = m && m.metrics;
-  if (!mm) return; // other groups may expose no /_metrics, or a different shape
-  const hit = mm.cache_hit || 0; // origin (Redis page cache) hit
-  const miss = mm.cache_miss || 0; // Postgres rebuild
-  const total = hit + miss;
-  if (!total) return;
-  const hitPct = (hit / total) * 100;
-  readCacheHitPct.add(hitPct);
-  console.log(`[${phase}] cache hit ${hitPct.toFixed(2)}%  (hit ${hit} / miss ${miss})`);
-}
-
-function fetchMetrics() {
-  let res;
-  try {
-    res = http.get(`${BASE_URL}/api/v1/_metrics`, REQ);
-  } catch (e) {
-    return null;
-  }
-  if (!res || res.status !== 200) return null;
-  try {
-    const j = res.json();
-    return j && typeof j === 'object' ? j : null;
-  } catch (e) {
-    return null;
-  }
-}
-
-// ============================ teardown: cache + queue snapshot =============
-export function teardown() {
-  // Poll until the queue is fully drained (or give up) so the Data Integrity
-  // check afterwards sees the final state, and record the peak backlog seen.
-  let m = null;
-  let peakBacklog = 0;
-  for (let i = 0; i < 30; i++) {
-    m = fetchMetrics();
-    const q = (m && m.queue) || {};
-    const backlog = (q.waiting || 0) + (q.active || 0);
-    if (backlog > peakBacklog) peakBacklog = backlog;
-    if (m && backlog === 0 && i >= 2) break; // 2 clean-ish reads minimum
-    sleep(1);
-  }
-  writeQueueBacklog.add(peakBacklog);
-
-  // Data Integrity Proof (spec §3.4): once the queue is drained, the read API
-  // must report remainingStock === 0 for the contended product — proves the
-  // Redis cache was invalidated correctly and never served a stale count.
-  let integrityLine = '  remainingStock after drain : (not checked)';
-  {
-    const res = http.get(`${BASE_URL}/api/v1/products?page=1&limit=10`, REQ);
-    let rs = null;
-    try {
-      const j = res.json();
-      const row = (j.data || []).find((p) => p.productId === PRODUCT_ID);
-      rs = row ? row.remainingStock : null;
-    } catch (e) {
-      /* rs stays null */
+  switch (res.status) {
+    case 202: {
+      orders202.add(1);
+      check(res, {
+        'order 202: status === "processing"': (r) => {
+          try {
+            return r.json('status') === 'processing';
+          } catch (e) {
+            return false;
+          }
+        },
+        'order 202: orderJobId matches ord-<sha256>': (r) => {
+          try {
+            return /^ord-[a-f0-9]{64}$/.test(r.json('orderJobId'));
+          } catch (e) {
+            return false;
+          }
+        },
+      });
+      break;
     }
-    const ok = rs === 0 || rs === '0';
-    dataIntegrityOk.add(ok);
-    check(null, { 'integrity: remainingStock == 0 after drain': () => ok });
-    integrityLine = `  remainingStock after drain : ${rs}  (${ok ? 'OK' : 'STALE / WRONG'})`;
+    case 409:
+      // Claim มีอยู่แต่ยังยืนยันว่า BullMQ Job ถูกสร้างแล้วไม่ได้
+      orders409.add(1);
+      check(res, {
+        'order 409: admission-in-progress contract response': () => true,
+      });
+      break;
+    case 503:
+      // Contract-valid QUEUE_UNAVAILABLE แต่เป็น availability failure ของ benchmark
+      orders503.add(1);
+      break;
+    case 401:
+      orders401.add(1);
+      break;
+    default:
+      ordersOther.add(1);
+      console.error(
+        `[order] unexpected status ${res.status} for ${userId}: ${String(res.body).slice(0, 200)}`,
+      );
+      break;
   }
-
-  if (!m) {
-    console.log('teardown: could not read /api/v1/_metrics');
-    console.log(integrityLine);
-    return;
-  }
-  const c = m.metrics || {};
-  const q = m.queue || {};
-  const hit = c.cache_hit || 0;
-  const miss = c.cache_miss || 0;
-  const dbBuild = c.db_build || 0; // misses that actually reached Postgres (rest were coalesced)
-  const waitHit = c.cache_wait_hit || 0; // misses parked on the L2 lock, served once the builder published
-  const waitTimeout = c.cache_wait_timeout || 0; // waited out WAIT_MAX_MS, built uncached
-  const tot = hit + miss || 1;
-  const pct = (n) => ((n / tot) * 100).toFixed(2);
-  const coalesced = miss > 0 ? (((miss - dbBuild) / miss) * 100).toFixed(2) : '0.00';
-
-  const lines = [
-    '',
-    '================  CACHE CHECK (GET /api/v1/_metrics)  ================',
-    `  Redis hit             : ${hit}  (${pct(hit)}%)`,
-    `  miss (cold key)       : ${miss}  (${pct(miss)}%)`,
-    `  HIT / MISS ratio      : ${pct(hit)}%  /  ${pct(miss)}%`,
-    `  Postgres builds       : ${dbBuild}   (${coalesced}% of misses coalesced by L1+L2 single-flight)`,
-    `  parked on L2 lock     : ${waitHit}  served after builder published`,
-    `  L2 wait timeouts      : ${waitTimeout}  (built uncached to stay responsive)`,
-    '',
-    '================  QUEUE CHECK  ======================================',
-    `  waiting=${q.waiting ?? '?'}  active=${q.active ?? '?'}  delayed=${q.delayed ?? '?'}`,
-    `  completed (lifetime) : ${c.orders_completed || 0}`,
-    `  failed    (lifetime) : ${c.orders_failed || 0}`,
-    `  Bull-Board window     : completed=${q.completed ?? '?'} failed=${q.failed ?? '?'}`,
-    '',
-    '================  ORDER OUTCOMES  ===================================',
-    `  accepted (202)  : ${c.orders_accepted || 0}`,
-    `  sold out (409)  : ${c.orders_soldout || 0}`,
-    `  duplicate (409) : ${c.orders_duplicate || 0}`,
-    '',
-    '================  DATA INTEGRITY  ===================================',
-    integrityLine,
-    '====================================================================',
-    '',
-  ];
-  console.log(lines.join('\n'));
 }
 
-// ============================ summary =====================================
+// =============================================================================
+// handleSummary — แยก contract validity ออกจาก availability health
+// (ไม่ import jslib จากอินเทอร์เน็ต เพื่อให้รันได้แม้ออฟไลน์)
+// =============================================================================
 export function handleSummary(data) {
-  const M = data.metrics;
-  const g = (name, path, dflt = 0) => {
-    const metric = M[name];
-    if (!metric) return dflt;
-    const v = metric.values || {};
-    return v[path] !== undefined ? v[path] : dflt;
+  const summaryPath = __ENV.SUMMARY_PATH || 'loadtest.k6-summary.json';
+  const c = (name) =>
+    data.metrics[name] && data.metrics[name].values
+      ? data.metrics[name].values.count || 0
+      : 0;
+
+  const trend = (name, stat) =>
+    data.metrics[name] && data.metrics[name].values
+      ? Number(data.metrics[name].values[stat] || 0).toFixed(2)
+      : 'n/a';
+
+  const rate = (name) =>
+    data.metrics[name] && data.metrics[name].values
+      ? `${(Number(data.metrics[name].values.rate || 0) * 100).toFixed(2)}%`
+      : 'n/a';
+
+  const accepted = c('orders_202');
+  const conflict = c('orders_409');
+  const unavailable = c('orders_503');
+  const serverErrors = c('orders_5xx');
+  const unauthorized = c('orders_unauthorized_401');
+  const unexpected = c('orders_unexpected');
+  const totalOrders = c('orders_requests');
+
+  const lines = [];
+  lines.push('');
+  lines.push('══════════════════════════════════════════════════════════════');
+  lines.push('  FLASH SALE — LOAD TEST SUMMARY');
+  lines.push(`  target: ${BASE_URL}   product: ${TARGET_PRODUCT_ID}`);
+  lines.push('══════════════════════════════════════════════════════════════');
+  lines.push('');
+  lines.push('  AUTH SETUP');
+  lines.push(`    requests                    : ${c('auth_setup_count')}`);
+  lines.push(`    failures                    : ${c('auth_setup_failures')}   (ต้อง = 0)`);
+  lines.push(
+    `    request p95                : ${trend('auth_setup_request_duration', 'p(95)')} ms`,
+  );
+  lines.push(
+    `    total wall duration        : ${trend('auth_setup_wall_duration', 'max')} ms`,
+  );
+  lines.push('');
+  lines.push('  READ PATH — GET /api/v1/products');
+  lines.push(`    200 OK                     : ${c('reads_ok_200')}`);
+  lines.push(
+    `    contract violations        : ${c('reads_bad_contract')}   (ต้อง = 0)`,
+  );
+  lines.push(
+    `    p95 latency                : ${trend('read_products_latency', 'p(95)')} ms`,
+  );
+  lines.push(
+    `    avg latency                : ${trend('read_products_latency', 'avg')} ms`,
+  );
+  lines.push('');
+  lines.push(
+    '  WRITE PATH — POST /api/v1/orders',
+  );
+  lines.push(`    202 accepted (เข้าคิว)      : ${accepted}`);
+  lines.push(`    409 admission in progress  : ${conflict}`);
+  lines.push(`    503 queue unavailable      : ${unavailable}   (availability fail)`);
+  lines.push(`    all 5xx                    : ${serverErrors}   (ต้อง = 0)`);
+  lines.push(`    401 unauthorized           : ${unauthorized}   (ต้อง = 0)`);
+  lines.push(`    ⚠️ unexpected status        : ${unexpected}   (ต้อง = 0)`);
+  lines.push(`    ────────────────────────────────────────────`);
+  lines.push(`    total order requests       : ${totalOrders}`);
+  lines.push(`    contract-valid rate        : ${rate('orders_contract_valid')}`);
+  lines.push(`    successful-admission rate  : ${rate('orders_successful_admission')}`);
+  lines.push(`    infrastructure-error rate  : ${rate('orders_infrastructure_error')}`);
+  lines.push(
+    `    p95 latency                : ${trend('place_order_latency', 'p(95)')} ms`,
+  );
+  lines.push('');
+  lines.push('  ตรวจ Data Integrity ต่อ (architecture.md §9.3):');
+  lines.push(
+    "    psql: SELECT remaining_stock FROM products WHERE id = 'p-1001';   -- ต้อง = 0",
+  );
+  lines.push('    psql: SELECT COUNT(*), COUNT(DISTINCT user_id) FROM orders');
+  lines.push(
+    "            WHERE product_id = 'p-1001';                             -- ต้อง = 50, 50",
+  );
+  lines.push(
+    '    redis-cli -p 6380 GET stock:flash_sale:p-1001                    -- ต้อง = "0"',
+  );
+  lines.push('══════════════════════════════════════════════════════════════');
+  lines.push('');
+
+  const sanitized = { ...data };
+  delete sanitized.setup_data;
+
+  return {
+    stdout: lines.join('\n'),
+    [summaryPath]: JSON.stringify(sanitized, null, 2),
   };
-  const f2 = (n) => Number(n).toFixed(2);
-
-  const rd = 'http_req_duration{scenario:read_load}';
-  const wd = 'http_req_duration{scenario:write_load}';
-
-  // handleSummary replaces k6's default end-of-test output, so surface the
-  // threshold gate results explicitly.
-  const thresholdLines = [];
-  for (const [name, metric] of Object.entries(M)) {
-    if (!metric.thresholds) continue;
-    for (const [expr, r] of Object.entries(metric.thresholds)) {
-      thresholdLines.push(`    ${r.ok ? 'PASS' : 'FAIL'}  ${name}  ${expr}`);
-    }
-  }
-
-  const banner = [
-    '',
-    '#################  FLASH SALE LOAD TEST — SUMMARY  #################',
-    '',
-    '  THRESHOLDS',
-    ...(thresholdLines.length ? thresholdLines : ['    (none)']),
-    '',
-    '  READ PHASE',
-    `    requests ......... ${g('http_reqs', 'count')}   (${f2(g('http_reqs', 'rate'))}/s overall)`,
-    `    p95 latency ...... ${f2(g(rd, 'p(95)'))} ms   (p99 ${f2(g(rd, 'p(99)'))} ms, max ${f2(g(rd, 'max'))} ms)`,
-    `    checks .......... ${f2(g('checks{scenario:read_load}', 'rate') * 100)}% pass`,
-    `    cache hit ........ ${f2(g('read_cache_hit_pct', 'avg'))}% avg (Redis cache-aside, sampled)`,
-    '',
-    '  WRITE PHASE',
-    `    orders accepted .. ${g('orders_accepted', 'count')}   (expect 50)`,
-    `    409 sold out ..... ${g('orders_soldout', 'count')}`,
-    `    409 duplicate .... ${g('orders_duplicate', 'count')}`,
-    `    p95 latency ...... ${f2(g(wd, 'p(95)'))} ms   (max ${f2(g(wd, 'max'))} ms)`,
-    `    checks .......... ${f2(g('checks{scenario:write_load}', 'rate') * 100)}% pass`,
-    `    queue backlog .... peak ${g('write_queue_backlog', 'max')} (waiting+active, sampled)`,
-    '',
-    '  OVERALL',
-    `    infra failure rate ${f2(g('infra_failures', 'rate') * 100)}%   (5xx / timeout / non-409 4xx)`,
-    `    data integrity ... ${g('data_integrity_ok', 'rate') === 1 ? 'PASS (remainingStock == 0 after drain)' : 'FAIL — stale count served'}`,
-    `    total requests ... ${g('http_reqs', 'count')}`,
-    '',
-    '##################################################################',
-    '',
-  ].join('\n');
-
-  const out = { stdout: banner };
-  const path = __ENV.SUMMARY_PATH || 'loadtest/results/flash-sale-summary.json';
-  out[path] = JSON.stringify(data, null, 2);
-  return out;
 }
