@@ -32,7 +32,7 @@ export class ProductsService {
   constructor(
     @InjectRepository(Product) private readonly repo: Repository<Product>,
     private readonly redis: RedisService,
-  ) {}
+  ) { }
 
   async findAll(page: number, limit: number) {
     await this.ensureActiveProductIdIndex();
@@ -113,7 +113,7 @@ export class ProductsService {
     }
 
     if (fragmentCacheHit) {
-      await this.redis.recordFragmentCacheHit();
+      this.redis.recordFragmentCacheHit().catch(() => { });
     }
     // Note: cache misses are NOT counted here. Miss counting lives inside
     // fetchMissingProductsFromDb() so it reflects each distinct product that was
