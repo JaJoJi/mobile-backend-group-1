@@ -152,7 +152,7 @@ See §9 for what the k6 report looks like.
  │  6 × NestJS instances (nest-1..6)             │
  │  Each instance:                               │
  │    • API server on :3000                      │
- │    • BullMQ worker (concurrency: 16) on :3001 │ ← Bull-Board
+ │    • BullMQ worker (concurrency: 4) on :3001  │ ← Bull-Board
  │    • Stateless JWT validation                 │
  └─────────────┬─────────────────────────────────┘
                │
@@ -174,7 +174,7 @@ See §9 for what the k6 report looks like.
 | `least_conn` nginx | Every request can land on any instance — no sticky session needed |
 | All state in Redis | Inventory, locks, idempotency flags, cache — shared, atomic |
 | Stateless JWT | Each instance can validate any token without a session store |
-| Worker on every instance | 6 × 16 = 96 parallel jobs; no separate worker tier to manage |
+| Worker on every instance | 6 × 4 = 24 parallel jobs; no separate worker tier to manage |
 
 ### 3.3 Read/Write Split (TypeORM replication)
 
@@ -361,7 +361,7 @@ JWT payload: `{ sub: "user-42", iat, exp }` · TTL: 1 h (configurable via `JWT_E
 | 2 | Duplicate purchase | User buys same product twice | `order:purchased` + `user:cooldown` + DB `UNIQUE` |
 | 3 | Same-user race (sub-100 ms) | Both clicks get 202 | `user:cooldown` (3 s TTL) |
 | 4 | Cold-start flood | After reset, every request passes → queue explodes | Cold-start protection: missing stockKey → `SOLD_OUT` |
-| 5 | Lock contention | Many workers hit one row → `55P03` | `concurrency: 16` per instance + `lock_timeout 2 s` + `attempts: 2` |
+| 5 | Lock contention | Many workers hit one row → `55P03` | `concurrency: 4` per instance + `lock_timeout 2 s` + `attempts: 2` |
 | 6 | Worker crash mid-process | Job stuck, lock held forever | `lock_timeout 2 s` + `lockKey TTL 60 s` + `finally` DEL |
 | 7 | Stale idempotency after `23505` | False-positive "already purchased" for 24 h | `purchasedKey` only set post-commit; on `23505` we set it then return success (self-heal) |
 
@@ -449,7 +449,7 @@ return 'OK'
 ### 8.1 Worker config
 
 ```typescript
-@Processor('orders', { concurrency: 16 })
+@Processor('orders', { concurrency: 4 })
 export class OrdersProcessor extends WorkerHost { /* ... */ }
 ```
 
@@ -458,7 +458,7 @@ export class OrdersProcessor extends WorkerHost { /* ... */ }
 { removeOnComplete: 1000, removeOnFail: 1000, attempts: 2, backoff: { type: 'fixed', delay: 250 } }
 ```
 
-6 instances × 16 concurrency = **96 parallel jobs** total.
+6 instances × 4 concurrency = **24 parallel jobs** total.
 
 ### 8.2 Worker flow
 
@@ -510,12 +510,18 @@ async process(job) {
 }
 ```
 
-### 8.3 Why `concurrency: 16`?
+### 8.3 Why `concurrency: 4`?
 
-We tried `2`, `10`, and `16`. The sweet spot:
-- 16 keeps each instance's PG connection pool under the 100-conn ceiling
-- `lock_timeout = 2 s` aborts a stuck `SELECT FOR UPDATE` before BullMQ considers the job stalled
-- Combined with `attempts: 2` + 250 ms backoff, transient `55P03`s recover without operator intervention
+Originally set to `16` (96 parallel jobs across 6 instances). Under the 1,000-VU read + 500-VU write load, that many workers hammering the same `p-1001` row caused measurable `55P03` lock timeouts (visible as `HTTP 5xx` from the API). Dropping to `4` per instance gives **24 parallel jobs** total — still plenty for 50 winners — while keeping row-lock contention low.
+
+Why not lower?
+- 4 keeps the queue draining fast: 50 jobs finish in ~2 s even with pessimistic locks
+- Keeps each instance's PG connection pool well under the 100-conn ceiling
+
+Why not higher?
+- Each worker holds its PG connection for the duration of the pessimistic transaction. More concurrent workers = more concurrent row-lock attempts on the hot row = more `55P03` retries = more wasted BullMQ work and visible API failures.
+
+`lock_timeout = 2 s` + `attempts: 2` + 250 ms backoff absorb any transient `55P03` that does slip through.
 
 ### 8.4 Why no `@OnWorkerEvent('failed')` stock-compensation handler?
 

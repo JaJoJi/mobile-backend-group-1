@@ -27,7 +27,7 @@ const PG_UNIQUE_VIOLATION = '23505';
 // flag semantics (24h idempotency window) stay identical.
 const PURCHASED_TTL_SECONDS = 24 * 60 * 60;
 
-@Processor('orders', { concurrency: 16 })
+@Processor('orders', { concurrency: 4 })
 export class OrdersProcessor extends WorkerHost {
   constructor(
     @InjectDataSource() private readonly dataSource: DataSource,
