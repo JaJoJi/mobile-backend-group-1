@@ -230,6 +230,69 @@ services:
       retries: 5
       start_period: 30s
 
+  nest-10:
+    container_name: nest-10
+    build: ./flash-sale-backend
+    depends_on:
+      - postgres-primary
+      - postgres-replica
+      - redis
+    env_file: ./flash-sale-backend/.env.docker
+    environment:
+      INSTANCE_ID: nest-10
+    volumes:
+      - ./products-seed.json:/app/products-seed.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  nest-11:
+    container_name: nest-11
+    build: ./flash-sale-backend
+    depends_on:
+      - postgres-primary
+      - postgres-replica
+      - redis
+    env_file: ./flash-sale-backend/.env.docker
+    environment:
+      INSTANCE_ID: nest-11
+    volumes:
+      - ./products-seed.json:/app/products-seed.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  nest-12:
+    container_name: nest-12
+    build: ./flash-sale-backend
+    depends_on:
+      - postgres-primary
+      - postgres-replica
+      - redis
+    env_file: ./flash-sale-backend/.env.docker
+    environment:
+      INSTANCE_ID: nest-12
+    volumes:
+      - ./products-seed.json:/app/products-seed.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   nginx:
     container_name: nginx
     image: nginx:1.27-alpine
@@ -256,6 +319,12 @@ services:
       nest-8:
         condition: service_healthy
       nest-9:
+        condition: service_healthy
+      nest-10:
+        condition: service_healthy
+      nest-11:
+        condition: service_healthy
+      nest-12:
         condition: service_healthy
 
 volumes:
