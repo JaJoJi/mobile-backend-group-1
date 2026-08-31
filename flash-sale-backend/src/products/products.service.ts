@@ -414,6 +414,8 @@ export class ProductsService {
     // the distinct DB fallback reads (e.g. 11 misses for 11 missing products).
     await this.redis.recordFragmentCacheMiss(rows.length);
 
+    const stockEntries: Array<{ productId: string; stockValue: number }> = [];
+
     for (const row of rows) {
       const staticRecord: ProductStaticRecord = {
         productId: row.productId,
@@ -437,32 +439,35 @@ export class ProductsService {
         ttlSeconds: 24 * 60 * 60,
       });
 
-      // stock:{id} uses a 10-minute TTL. The DECR-by-API overflow counter must
-      // remain authoritative for the entire flash sale duration (typically
-      // <1h). A short TTL (e.g. 30s) caused cold-start bypass during the
-      // k6 40s test: once stockKey TTL expired mid-test, Lua saw stockVal=nil
-      // and skipped DECR entirely, letting thousands of overflow requests
-      // through to the queue. The 10-minute TTL keeps the counter alive across
-      // brief outages; it self-heals on next hydration if PG ever drifts.
-      writeBack.push({
-        key: this.stockKey(row.productId),
-        value: stockValue,
-        ttlSeconds: 60 * 10,
-      });
-
-      // Sync the sticky sold-out flag if PG confirms remainingStock=0, so
-      // the API fast-fail Lua catches it without waiting for a worker SET.
-      if (stockValue === 0) {
-        writeBack.push({
-          key: this.soldOutKey(row.productId),
-          value: '1',
-          ttlSeconds: 24 * 60 * 60,
-        });
-      }
+      // Defer stock/soldout writes so we can apply them with NX
+      // (only fill missing keys, never stomp live DECR-decremented values).
+      stockEntries.push({ productId: row.productId, stockValue });
     }
 
     if (writeBack.length > 0) {
       await this.redis.mset(writeBack);
+    }
+
+    // Stock & soldout keys: SET ... NX (only if missing).
+    //
+    // Critical: the Lua fast-fail script atomically DECRs `stock:{id}` on
+    // every accepted order. If hydration SETs unconditionally on every cache
+    // miss, it can overwrite a live DECR-decremented value with the (stale)
+    // PG remainingStock while workers are still committing — letting through
+    // more requests than the actual stock (observed: 112 HTTP 202 vs 50
+    // SUCCESS in the k6 test).
+    //
+    // NX preserves any in-flight DECR counter and only fills truly missing
+    // keys on cold start. Trade-off: if PG ever drifts from Redis stock, we
+    // no longer auto-heal on the next hydration — we wait for the 10-minute
+    // TTL to expire. Acceptable because (a) drift only causes mild
+    // over-rejection, never over-admission, and (b) PG's pessimistic lock
+    // is the authoritative gate regardless.
+    for (const entry of stockEntries) {
+      await this.redis.setNx(this.stockKey(entry.productId), entry.stockValue, 60 * 10);
+      if (entry.stockValue === 0) {
+        await this.redis.setNx(this.soldOutKey(entry.productId), '1', 24 * 60 * 60);
+      }
     }
 
     return byId;
