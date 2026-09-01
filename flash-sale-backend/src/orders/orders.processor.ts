@@ -1,15 +1,9 @@
-import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
-import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { InjectDataSource } from '@nestjs/typeorm';
 import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
 import type { Job } from 'bullmq';
-import {
-  DataSource,
-  QueryFailedError,
-  Repository,
-} from 'typeorm';
+import { DataSource, QueryFailedError } from 'typeorm';
 import { RedisService } from '../cache/redis.service';
-import { Product } from '../products/entities/product.entity';
-import { Order } from './entities/order.entity';
 
 interface OrderJobData {
   userId: string;
@@ -23,11 +17,19 @@ interface OrderJobData {
 // BullMQ worker responsive but long enough to absorb a single hot row.
 const PG_LOCK_TIMEOUT_MS = 2000;
 
+// PostgreSQL unique-violation code: raised when an INSERT collides with the
+// UNIQUE ("userId", "productId") constraint on the orders table. This is the
+// ONLY signal the worker treats as a genuine duplicate (already-purchased).
+const PG_UNIQUE_VIOLATION = '23505';
+
+// TTL for the `order:purchased:{u}:{p}` flag written by the self-healing
+// path. Mirrors the TTL used on the normal post-commit success path so the
+// flag semantics (24h idempotency window) stay identical.
+const PURCHASED_TTL_SECONDS = 24 * 60 * 60;
+
 @Processor('orders', { concurrency: 2 })
 export class OrdersProcessor extends WorkerHost {
   constructor(
-    @InjectRepository(Product) private readonly productRepo: Repository<Product>,
-    @InjectRepository(Order) private readonly orderRepo: Repository<Order>,
     @InjectDataSource() private readonly dataSource: DataSource,
     private readonly redis: RedisService,
     @InjectPinoLogger(OrdersProcessor.name)
@@ -55,7 +57,7 @@ export class OrdersProcessor extends WorkerHost {
         { ...logCtx, reason: 'ALREADY_PURCHASED' },
         'order job skipped: user already purchased',
       );
-      throw new Error('ALREADY_PURCHASED');
+      return { ok: true, reason: 'ALREADY_PURCHASED' };
     }
 
     let remainingStock = 0;
@@ -106,32 +108,14 @@ export class OrdersProcessor extends WorkerHost {
 
         // 3. INSERT order. If UNIQUE (userId, productId) collides, the whole
         // transaction rolls back, the PG decrement is undone automatically,
-        // and we throw to the outer catch. No Redis writes happen here, so
-        // nothing needs manual compensation on rollback.
-        try {
-          await manager.query(
-            `INSERT INTO "orders" ("id", "userId", "productId", "status", "failureReason", "createdAt", "updatedAt")
-             VALUES (gen_random_uuid(), $1, $2, $3, NULL, now(), now())`,
-            [userId, productId, 'SUCCESS'],
-          );
-        } catch (insertErr) {
-          const isUniqueViolation =
-            insertErr instanceof QueryFailedError &&
-            (insertErr as QueryFailedError & { code?: string }).code === '23505';
-
-          if (isUniqueViolation) {
-            this.logger.warn(
-              { ...logCtx, reason: 'DUPLICATE_USER_PRODUCT' },
-              'order rejected: duplicate (unique constraint) - transaction will roll back',
-            );
-          } else {
-            this.logger.error(
-              { ...logCtx, err: insertErr },
-              'order persistence failed - transaction will roll back',
-            );
-          }
-          throw insertErr;
-        }
+        // and the error propagates to the outer catch for classification
+        // (23505 → self-heal; otherwise → re-throw for BullMQ retry). No
+        // Redis writes happen here, so nothing needs manual compensation.
+        await manager.query(
+          `INSERT INTO "orders" ("id", "userId", "productId", "status", "failureReason", "createdAt", "updatedAt")
+           VALUES (gen_random_uuid(), $1, $2, $3, NULL, now(), now())`,
+          [userId, productId, 'SUCCESS'],
+        );
       }); // COMMIT here - row lock released, changes visible.
 
       // ------------------------------------------------------------------
@@ -143,7 +127,7 @@ export class OrdersProcessor extends WorkerHost {
       // Idempotency marker: only a committed SUCCESS row may set this. A
       // 23505 duplicate on a rolled-back tx will never reach this line, so
       // the false-positive "blocked for 24h without a purchase" bug is gone.
-      await this.redis.set(purchasedKey, '1', 24 * 60 * 60);
+      await this.redis.set(purchasedKey, '1', PURCHASED_TTL_SECONDS);
 
       // Sticky sold-out flag: only set when the committed decrement drove
       // remainingStock to exactly 0. If the last item's transaction rolls
@@ -155,75 +139,51 @@ export class OrdersProcessor extends WorkerHost {
       this.logger.info(logCtx, 'order processed successfully');
       return { ok: true };
     } catch (err) {
-      // The pessimistic transaction handles all rollback automatically:
-      // - OUT_OF_STOCK / PRODUCT_NOT_FOUND: no PG change (we threw before UPDATE).
-      // - 23505 / transient errors: whole transaction rolled back; PG and
-      //   Redis stock are unchanged. Because no Redis flags are written in-tx,
-      //   there is no compensation needed here — Redis and the DB stay
-      //   consistent by construction.
+      // DECISION 3 — Deduplication & worker self-healing.
+      //
+      // The pessimistic transaction has already rolled itself back, so the
+      // PG decrement is undone automatically and no Redis flags were written
+      // in-tx. Now classify the error:
+      //
+      // 1. PostgreSQL 23505 (unique violation on UNIQUE(userId, productId)):
+      //    a genuine duplicate — the user already owns a SUCCESS row for this
+      //    product. Self-heal: set the `already_purchased` flag so every future
+      //    request for this (user, product) is blocked instantly at the Redis
+      //    hot-path, then complete the job cleanly (no retry, no error).
+      //
+      // 2. Any other error (OUT_OF_STOCK, PRODUCT_NOT_FOUND, transient DB /
+      //    network drops, lock timeouts): release locks in `finally`, keep
+      //    stock intact, and re-throw so BullMQ applies its normal retry
+      //    backoff. We do NOT treat generic errors as duplicates.
+      const isUniqueViolation =
+        err instanceof QueryFailedError &&
+        (err as QueryFailedError & { code?: string }).code === PG_UNIQUE_VIOLATION;
+
+      if (isUniqueViolation) {
+        this.logger.warn(
+          { ...logCtx, reason: 'DUPLICATE_USER_PRODUCT' },
+          'duplicate order detected (23505); self-healing: setting already_purchased flag and completing job',
+        );
+
+        // Self-heal step 1: set the dedup flag so future requests are blocked
+        // at the Redis hot-path (matching the post-commit success path's TTL).
+        await this.redis.set(purchasedKey, '1', PURCHASED_TTL_SECONDS);
+
+        // Self-heal step 2: complete cleanly instead of throwing/retrying.
+        return { ok: true, reason: 'ALREADY_PURCHASED' };
+      }
+
+      // Generic failure: no INCR / stock compensation (DECISION 1 — ghost
+      // stock is acceptable and cleaned up offline; we never restore stock).
+      this.logger.error(
+        { ...logCtx, err },
+        'order processing failed; releasing lock and re-throwing for BullMQ retry (no stock compensation)',
+      );
       throw err;
     } finally {
       // Best-effort lock release. If the API was a no-op (Lua returned OK
       // but the API process died before DEL), the TTL will clean it up.
       await this.redis.del(lockKey);
     }
-  }
-
-  // Compensating stock restore for a job that FAILED to materialize an order in
-  // PostgreSQL. The API's Lua fast-fail already DECR'd the Redis stock counter
-  // before enqueueing this job. When the worker ultimately fails (DB rollback,
-  // transient error, validation failure, crash), that DECR is now "orphaned" —
-  // Redis under-reports stock relative to PG, which looks like ghost sold-out.
-  //
-  // We hook the `failed` event (not `process`'s catch) because it fires exactly
-  // ONCE per job after all `attempts` are exhausted. Hooking the catch block
-  // would compensate on every retry attempt and double-restore if a later retry
-  // succeeded. The marker key makes the INCR idempotent even across duplicate
-  // `failed` emissions or cross-instance races.
-  @OnWorkerEvent('failed')
-  async onJobFailed(job: Job<OrderJobData>, error: Error): Promise<void> {
-    const { userId, productId } = job.data;
-    const stockKey = `stock:${productId}`;
-    const restoreKey = `order:stock:restore:${job.id ?? `${userId}:${productId}`}`;
-
-    // OUT_OF_STOCK means PostgreSQL was already at zero before this job ran: no
-    // PG decrement was rolled back, and the worker's in-tx logic has already set
-    // (or will set) the sticky sold-out flag. Compensating here would push Redis
-    // ABOVE zero and defeat the sold-out fast-fail, inviting a flood of wasted
-    // jobs. Every other failure left Redis one lower than PG, so restore once.
-    if (error?.message === 'OUT_OF_STOCK') {
-      this.logger.warn(
-        { jobId: job.id, userId, productId },
-        'job failed with OUT_OF_STOCK; skipping stock compensation',
-      );
-      return;
-    }
-
-    const restored = await this.redis.compensateFailedStock(
-      stockKey,
-      restoreKey,
-      24 * 60 * 60,
-    );
-
-    if (restored > 0) {
-      this.logger.warn(
-        { jobId: job.id, userId, productId, restoredTo: restored },
-        'compensated Redis stock for failed order job',
-      );
-    }
-  }
-
-  private async recordOrder(
-    userId: string,
-    productId: string,
-    status: 'SUCCESS' | 'FAILED',
-    failureReason?: string,
-  ) {
-    return this.orderRepo.save({
-      userId,
-      productId,
-      status,
-      failureReason: failureReason ?? null,
-    });
   }
 }

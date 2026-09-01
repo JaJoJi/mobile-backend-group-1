@@ -1,6 +1,10 @@
-import { Injectable, Logger as NestLogger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import {
+  Injectable,
+  Logger as NestLogger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { RedisService } from '../cache/redis.service';
 import { Product } from './entities/product.entity';
@@ -15,11 +19,25 @@ export interface ProductStaticRecord {
   isFlashSaleActive: boolean;
 }
 
+interface ProductRow {
+  productId: string;
+  name: string;
+  description: string | null;
+  price: string | number;
+  availableStock: string | number;
+  remainingStock: string | number;
+  isFlashSaleActive: boolean;
+}
+
 @Injectable()
 export class ProductsService {
   private static readonly INDEX_KEY = 'products:id_list';
   private static readonly INDEX_REBUILD_LOCK_KEY = 'products:id_list:rebuild_lock';
   private static readonly INDEX_REBUILD_LOCK_TTL_SECONDS = 10;
+  // Distributed lock guarding cold-start hydration of missing fragments.
+  // "Losers" (instances that fail SET NX) do NOT re-query PostgreSQL — they
+  // await the winner's result via the in-process promise coalescing map below.
+  private static readonly HYDRATION_LOCK_TTL_SECONDS = 10;
 
   private readonly logger = new NestLogger(ProductsService.name);
 
@@ -31,30 +49,44 @@ export class ProductsService {
 
   constructor(
     @InjectRepository(Product) private readonly repo: Repository<Product>,
+    @InjectDataSource() private readonly dataSource: DataSource,
     private readonly redis: RedisService,
   ) { }
 
   async findAll(page: number, limit: number) {
-    await this.ensureActiveProductIdIndex();
-
-    const listKey = 'products:id_list';
+    const listKey = ProductsService.INDEX_KEY;
     const start = (page - 1) * limit;
     const stop = start + limit - 1;
 
+    // Single parallel round-trip for IDs and Total count
     const [ids, total] = await Promise.all([
       this.redis.lrange(listKey, start, stop),
       this.redis.llen(listKey),
     ]);
 
+    // Rebuild index only if Redis cache is cold
+    if (total === 0) {
+      await this.ensureActiveProductIdIndex();
+      const [rebuiltIds, rebuiltTotal] = await Promise.all([
+        this.redis.lrange(listKey, start, stop),
+        this.redis.llen(listKey),
+      ]);
+      return this.processProductsList(rebuiltIds, rebuiltTotal, page, limit);
+    }
+
+    return this.processProductsList(ids, total, page, limit);
+  }
+
+  private async processProductsList(ids: string[], total: number, page: number, limit: number) {
     if (ids.length === 0) {
       const emptyResult = {
         status: 'success',
         data: [],
         meta: {
-          total: 0,
+          total,
           page,
           limit,
-          totalPages: 0,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
         },
       };
       return emptyResult;
@@ -63,10 +95,11 @@ export class ProductsService {
     const detailKeys = ids.map((id) => this.staticKey(id));
     const stockKeys = ids.map((id) => this.stockKey(id));
 
-    const [detailValues, stockValues] = await Promise.all([
-      this.redis.mgetStrings(detailKeys),
-      this.redis.mgetStrings(stockKeys),
-    ]);
+    // Batch all keys into 1 single Redis MGET query
+    const allKeys = [...detailKeys, ...stockKeys];
+    const allValues = await this.redis.mgetStrings(allKeys);
+    const detailValues = allValues.slice(0, ids.length);
+    const stockValues = allValues.slice(ids.length);
 
     const detailMap = new Map<string, ProductStaticRecord>();
     const stockMap = new Map<string, number>();
@@ -248,9 +281,15 @@ export class ProductsService {
   // On a Redis cache miss, return the LIVE remaining stock, never the initial
   // total. Preference order:
   //   1. record.remainingStock (the live value maintained by the worker's
-  //      pessimistic PG transaction)
+  //      pessimistic PG transaction, read from the PRIMARY database)
   //   2. fallback (the already-cached stock fragment, if any)
-  //   3. record.availableStock (initial total) as a last resort
+  //
+  // DECISION 2: `availableStock` (the bootstrap seed value) is deliberately
+  // NOT consulted here. Reading it would reintroduce the oversell bug where a
+  // cache miss rehydrates the stock counter with the initial total instead of
+  // the live remaining value. If neither the live value nor the fallback is
+  // present, we return null and the caller treats the product as out-of-stock
+  // rather than guessing.
   private extractStock(record: ProductStaticRecord | undefined, fallback: number | undefined): number | null {
     if (record && typeof record === 'object') {
       const remaining = Number(record.remainingStock ?? record['remainingStock'] ?? NaN);
@@ -261,11 +300,6 @@ export class ProductsService {
       const fallbackValue = Number(fallback ?? NaN);
       if (Number.isFinite(fallbackValue) && fallbackValue >= 0) {
         return fallbackValue;
-      }
-
-      const total = Number(record.availableStock ?? NaN);
-      if (Number.isFinite(total) && total >= 0) {
-        return total;
       }
     }
 
@@ -283,7 +317,7 @@ export class ProductsService {
       return existing;
     }
 
-    const promise = this.fetchMissingProductsFromDb(missingIds)
+    const promise = this.hydrateWithStampedeGuard(missingIds)
       .finally(() => {
         this.inFlightLoads.delete(dedupeKey);
       });
@@ -292,30 +326,85 @@ export class ProductsService {
     return promise;
   }
 
-  private async fetchMissingProductsFromDb(missingIds: string[]): Promise<Record<string, ProductStaticRecord>> {
-    const rows = await this.repo
-      .createQueryBuilder('product')
-      .select([
-        'product."productId" AS "productId"',
-        'product."name" AS "name"',
-        'product."description" AS "description"',
-        'product."price" AS "price"',
-        'product."availableStock" AS "availableStock"',
-        'product."remainingStock" AS "remainingStock"',
-        'product."isFlashSaleActive" AS "isFlashSaleActive"',
-      ])
-      .where('product."productId" IN (:...ids)', { ids: missingIds })
-      .andWhere('product."isFlashSaleActive" = :active', { active: true })
-      .getRawMany<{
-        productId: string;
-        name: string;
-        description: string | null;
-        price: string | number;
-        availableStock: string | number;
-        remainingStock: string | number;
-        isFlashSaleActive: boolean;
-      }>();
+  // DECISION 2 — cache miss, hydration & stampede prevention.
+  //
+  // On a cold cache, thousands of instances/requests could simultaneously try to
+  // re-hydrate the same missing fragments, causing a thundering herd against
+  // PostgreSQL. Two layers of defense are combined here:
+  //
+  // 1. Distributed lock (Redis SET NX): exactly ONE API instance across the whole
+  //    cluster wins the right to query PostgreSQL. The key embeds the sorted
+  //    missing-ID set so distinct product batches hydrate independently.
+  //
+  // 2. In-process promise coalescing (`inFlightLoads`): on the winning instance,
+  //    concurrent requests for the same batch share a single Promise. Losers of
+  //    the distributed lock do NOT re-query PG — they either fail-fast (throw a
+  //    retryable error surfaced as 503) or, within the same process, await the
+  //    winner's in-flight promise. This prevents cascading client timeouts.
+  private async hydrateWithStampedeGuard(
+    missingIds: string[],
+  ): Promise<Record<string, ProductStaticRecord>> {
+    const sorted = missingIds.slice().sort();
+    const lockKey = `products:hydrate:lock:${sorted.join('|')}`;
+    const lockToken = randomUUID();
 
+    const acquired = await this.redis.setNx(
+      lockKey,
+      lockToken,
+      ProductsService.HYDRATION_LOCK_TTL_SECONDS,
+    );
+
+    if (!acquired) {
+      // Another instance owns this hydration. Fail-fast rather than querying
+      // PostgreSQL again — the client should retry once the winner has
+      // populated the cache. This avoids cascading client timeouts and keeps
+      // replica/primary load bounded under a stampede.
+      this.logger.warn(
+        `Hydration lock not acquired (${lockKey}); failing fast to avoid stampede`,
+      );
+      throw new ServiceUnavailableException({
+        status: 'service_unavailable',
+        message: 'Catalog cache is warming up, please retry shortly',
+      });
+    }
+
+    try {
+      return await this.fetchMissingProductsFromDb(sorted);
+    } finally {
+      await this.redis.raw().eval(
+        `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end`,
+        1,
+        lockKey,
+        lockToken,
+      );
+    }
+  }
+
+  private async fetchMissingProductsFromDb(missingIds: string[]): Promise<Record<string, ProductStaticRecord>> {
+    // DECISION 2: `remainingStock` MUST be read from the PRIMARY database, never
+    // from a read replica. Replica lag means a replica read can return a stale
+    // (higher) stock value right after a worker COMMIT, which rehydrates Redis
+    // with phantom stock and reintroduces oversell. We run this query through a
+    // dedicated connection on the primary ("master") node of the replication
+    // cluster, then release it back to the pool immediately.
+    const queryRunner = this.dataSource.createQueryRunner('master');
+    try {
+      const rows = await queryRunner.query(
+        `SELECT "productId", "name", "description", "price",
+                "availableStock", "remainingStock", "isFlashSaleActive"
+         FROM products
+         WHERE "productId" = ANY($1::varchar[])
+           AND "isFlashSaleActive" = $2`,
+        [missingIds, true],
+      );
+
+      return this.buildRecordsFromRows(rows as ProductRow[]);
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  private async buildRecordsFromRows(rows: ProductRow[]): Promise<Record<string, ProductStaticRecord>> {
     const byId: Record<string, ProductStaticRecord> = {};
     const writeBack: Array<{ key: string; value: unknown; ttlSeconds?: number }> = [];
 
@@ -324,6 +413,8 @@ export class ProductsService {
     // promise, this runs exactly once per cold-start batch and accurately reflects
     // the distinct DB fallback reads (e.g. 11 misses for 11 missing products).
     await this.redis.recordFragmentCacheMiss(rows.length);
+
+    const stockEntries: Array<{ productId: string; stockValue: number }> = [];
 
     for (const row of rows) {
       const staticRecord: ProductStaticRecord = {
@@ -335,7 +426,11 @@ export class ProductsService {
         isFlashSaleActive: Boolean(row.isFlashSaleActive),
       };
 
-      const stockValue = Number(row.remainingStock ?? row.availableStock ?? 0);
+      // Live remaining stock from the primary. Never fall back to
+      // `availableStock` — that would rehydrate the counter with the initial
+      // total and reintroduce oversell. If remainingStock is somehow null,
+      // treat as 0 (sold out) so the Lua fast-fail blocks further orders.
+      const stockValue = Number(row.remainingStock ?? 0);
 
       byId[row.productId] = staticRecord;
       writeBack.push({
@@ -344,32 +439,35 @@ export class ProductsService {
         ttlSeconds: 24 * 60 * 60,
       });
 
-      // stock:{id} uses a 1-hour TTL. The DECR-by-API overflow counter must
-      // remain authoritative for the entire flash sale duration (typically
-      // <1h). A short TTL (e.g. 30s) caused cold-start bypass during the
-      // k6 40s test: once stockKey TTL expired mid-test, Lua saw stockVal=nil
-      // and skipped DECR entirely, letting thousands of overflow requests
-      // through to the queue. 1h TTL keeps the counter alive throughout the
-      // sale; it self-heals on next hydration if PG ever drifts.
-      writeBack.push({
-        key: this.stockKey(row.productId),
-        value: stockValue,
-        ttlSeconds: 60 * 60,
-      });
-
-      // Sync the sticky sold-out flag if PG confirms remainingStock=0, so
-      // the API fast-fail Lua catches it without waiting for a worker SET.
-      if (stockValue === 0) {
-        writeBack.push({
-          key: this.soldOutKey(row.productId),
-          value: '1',
-          ttlSeconds: 24 * 60 * 60,
-        });
-      }
+      // Defer stock/soldout writes so we can apply them with NX
+      // (only fill missing keys, never stomp live DECR-decremented values).
+      stockEntries.push({ productId: row.productId, stockValue });
     }
 
     if (writeBack.length > 0) {
       await this.redis.mset(writeBack);
+    }
+
+    // Stock & soldout keys: SET ... NX (only if missing).
+    //
+    // Critical: the Lua fast-fail script atomically DECRs `stock:{id}` on
+    // every accepted order. If hydration SETs unconditionally on every cache
+    // miss, it can overwrite a live DECR-decremented value with the (stale)
+    // PG remainingStock while workers are still committing — letting through
+    // more requests than the actual stock (observed: 112 HTTP 202 vs 50
+    // SUCCESS in the k6 test).
+    //
+    // NX preserves any in-flight DECR counter and only fills truly missing
+    // keys on cold start. Trade-off: if PG ever drifts from Redis stock, we
+    // no longer auto-heal on the next hydration — we wait for the 10-minute
+    // TTL to expire. Acceptable because (a) drift only causes mild
+    // over-rejection, never over-admission, and (b) PG's pessimistic lock
+    // is the authoritative gate regardless.
+    for (const entry of stockEntries) {
+      await this.redis.setNx(this.stockKey(entry.productId), entry.stockValue, 60 * 10);
+      if (entry.stockValue === 0) {
+        await this.redis.setNx(this.soldOutKey(entry.productId), '1', 24 * 60 * 60);
+      }
     }
 
     return byId;

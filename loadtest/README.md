@@ -1,6 +1,6 @@
 # k6 Load Test — Flash Sale System
 
-Comprehensive coverage: distributed cache keys (with overflow mix), strict p-1001 write target, full data-integrity verification.
+Comprehensive coverage: distributed cache keys (with overflow mix), strict p-1001 write target, full data-integrity verification, **rich stage-banners + final ASCII report**.
 
 ## Install k6
 
@@ -27,7 +27,7 @@ sudo apt-get update && sudo apt-get install k6
 
 | File | Purpose |
 |---|---|
-| `flash-sale.js` | k6 script — 2 scenarios (read 1,000 VUs + write 500 VUs) |
+| `flash-sale.js` | k6 script — **5 stages** (pre-flight + auth + read 1k VUs + write 500 VUs + post-flight) with stage banners and a rich final ASCII report |
 | `reset.sh` / `reset.ps1` | Reset all 20 products from `products-seed.json` |
 | `verify.sh` / `verify.ps1` | Post-test SQL + Redis integrity report (console output) |
 
@@ -63,11 +63,15 @@ k6 run --env BASE_URL=http://localhost `
 
 ## What the script does
 
-| Phase | Time | VUs | Target |
-|---|---|---|---|
-| Setup | once | — | Fetch 500 JWTs (user-1 … user-500) |
-| Read | 0–30s | 1000 | `GET /api/v1/products` with random page/limit |
-| Write | 35–65s | 500 | `POST /api/v1/orders` for `p-1001`, 2-3 iters/VU |
+The script runs **5 stages**, each with its own ASCII banner printed to stdout so you can watch progress live:
+
+| Stage | Time | VUs | Target | Banner |
+|---|---|---|---|---|
+| 0  pre-flight  | once | — | `GET /health/ready` + `GET /api/v1/products/admin/cache-stats` (baseline) | `STAGE 0 · PRE-FLIGHT` |
+| 1  auth        | once | — | Fetch 500 JWTs sequentially (user-1 … user-500) with progress every 50 | `STAGE 1 · AUTH` |
+| 2  read load   | 30 s | 1000 | `GET /api/v1/products` with random page/limit | (k6 default progress) |
+| 3  write load  | 30 s | 500  | `POST /api/v1/orders` for `p-1001`, 2-3 iters/VU | (k6 default progress) |
+| 4  post-flight | once | — | `GET /api/v1/products/admin/cache-stats` + `GET /api/v1/orders?status=SUCCESS` | `STAGE 4 · POST-FLIGHT` |
 
 ## Read scenario — distributed cache key coverage
 
@@ -100,13 +104,13 @@ k6 run --env BASE_URL=http://localhost `
 
 | Layer | Counts as pass | Counts as fail (test exits non-zero) |
 |---|---|---|
-| HTTP | `200` (read), `202` / `409` (write) | Any `4xx` other than `409`, any `5xx`, timeout > 10 s, connection refused, DNS/TLS error |
-| Business | `202` = order accepted, `409` = stock exhausted / duplicate / lock conflict | — (no business-level "fail" — all are valid outcomes) |
+| HTTP | `200` (read), `202` / `409` / `429` (write) | Any `4xx` other than `409`/`429`, any `5xx`, timeout > 10 s, connection refused, DNS/TLS error |
+| Business | `202` = order accepted, `409` = sold-out / duplicate / lock, `429` = rate-limit | — (no business-level "fail" — all are valid outcomes) |
 
-Thresholds that gate the test (uses a **custom** `http_infra_failures` metric — k6's built-in `http_req_failed` counts every 4xx as failure, including our expected `409`):
+Thresholds that gate the test (uses a **custom** `http_infra_failures` metric — k6's built-in `http_req_failed` counts every 4xx as failure, including our expected `409`/`429`):
 
 ```
-http_infra_failures rate                    < 1%    (5xx + timeout + non-409 4xx)
+http_infra_failures rate                    < 1%    (5xx + timeout + non-409 4xx + 401)
 http_infra_failures{scenario:read_load}     < 1%
 http_infra_failures{scenario:write_load}    < 1%
 checks rate                                 > 99%   (every check() must pass)
@@ -117,21 +121,82 @@ http_req_duration p(95)                     < 500 ms (per scenario too)
 
 Per-request timeout is **10 s** (`REQ_PARAMS.timeout`).
 
-## Custom summary output
+## Custom summary output — boxed ASCII report
 
-`handleSummary` auto-creates `loadtest/results/`, prints a banner + writes `loadtest/results/summary.json`:
+At the end of the test, `handleSummary` writes a single boxed report to stdout and also saves a plain-text copy to `loadtest/results/report.txt` and the full k6 metrics to `loadtest/results/summary.json`. The report covers every deliverable in section 3 of the spec:
 
 ```
-============================================================
-  FLASH SALE LOAD TEST — BUSINESS SUMMARY
-============================================================
-  orders accepted (HTTP 202) .........: 50
-  orders conflicted (HTTP 409) .......: 1182
-  infra failure rate (5xx/timeout/4xx): 0.00%
-============================================================
+╔══════════════════════════════════════════════════════════════════════════╗
+║              FLASH SALE — LOAD TEST FINAL REPORT                       ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+┌── 0. STAGE RESULTS ──────────────────────────────────────────────────────────┐
+│ STAGE 0  pre-flight  : ✓ OK                                          │
+│ STAGE 1  auth setup  : ✓ OK  (500 tokens fetched)                    │
+│ STAGE 2  read load   : ✓ OK                                          │
+│ STAGE 3  write load  : ✓ OK                                          │
+│ STAGE 4  post-flight : ✓ OK                                          │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌── 1. CACHE PERFORMANCE (during test window) ─────────────────────────────────┐
+│ hits              : 27000                                                    │
+│ misses            : 1500                                                     │
+│ total read reqs   : 28500                                                    │
+│ hit ratio         : 94.74%    ███████████████████████████░                   │
+│ baseline (pre)    : hits=0  misses=0  ratio=0.00%                            │
+│ final    (post)   : hits=27000  misses=1500  ratio=94.74%                    │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌── 2. ORDER OUTCOMES (POST /api/v1/orders) ───────────────────────────────────┐
+│ HTTP 202  accepted          : 50     █░░░░░░░░░░░░░░░░░░░░░░░░               │
+│ HTTP 409  sold-out/dup/lock : 1180   ████████████████████████░               │
+│ HTTP 429  too many reqs     : 4      ░░░░░░░░░░░░░░░░░░░░░░░░░               │
+│ HTTP 401  auth fail         : 0                                              │
+│ HTTP 5xx  server error      : 0                                              │
+│ network / timeout           : 0                                              │
+│ TOTAL attempts              : 1234                                           │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌── 3. THROUGHPUT & LATENCY ───────────────────────────────────────────────────┐
+│ scenario           reqs     req/s    p50    p95    p99    max                │
+│ ────────────── ──────── ───────── ────── ────── ────── ──────                │
+│ READ  (1k vu)     28500     950.0   2.34   12.5   45.7    123                │
+│ WRITE (500vu)      1234      41.1   5.10   28.7   67.3    235                │
+│ ALL               29734     495.6   3.10   18.4   52.6    235                │
+│                                                                            │
+│ latency unit = ms   |   read status : 2xx=28500  4xx=0  5xx=0  net=0       │
+│ infra failure rate  :   0.00%  (target < 1%)                                 │
+│ auth setup latency  : avg=   12.3 ms  min=    8.1 ms  max=   45.6 ms        │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌── 4. BUSINESS RULES PROOF (p-1001, stock=50) ────────────────────────────────┐
+│ expected winners          : 50                                               │
+│ SUCCESS orders in DB      : 50                                               │
+│ unique userIds            : 50                                               │
+│ no duplicate (u,p) pairs  : ✓ YES                                            │
+│ integrity check           : ✓ PASS — no oversell, no underfill              │
+└────────────────────────────────────────────────────────────────────────────┘
+
+╔══════════════════════════════════════════════════════════════════════════╗
+║  OVERALL VERDICT :  ✓ PASS                                                  ║
+╚══════════════════════════════════════════════════════════════════════════╝
 ```
 
-Counters / rates emitted: `order_accepted_total`, `order_conflicted_total`, `http_infra_failures`.
+The boxes use Unicode box-drawing characters so they line up in any monospace terminal. Bar charts (`█░`) make hit/miss and order-outcome proportions easy to scan at a glance. ANSI colors (✓ green / ✗ red) are emitted to stdout but stripped from `report.txt`.
+
+Counters / rates emitted by the script (also visible in the standard k6 metric dump that follows the boxed report):
+
+| Metric | Type | Tags |
+|---|---|---|
+| `auth_latency_ms` | Trend | scenario=auth_setup |
+| `read_status_2xx` / `read_status_4xx` / `read_status_5xx` / `read_status_net_err` | Counter | scenario=read_load |
+| `order_accepted_202` | Counter | scenario=write_load |
+| `order_conflict_409` | Counter | scenario=write_load |
+| `order_conflict_429` | Counter | scenario=write_load |
+| `order_auth_fail_401` | Counter | scenario=write_load |
+| `order_server_5xx` | Counter | scenario=write_load |
+| `order_net_err` | Counter | scenario=write_load |
+| `http_infra_failures` | Rate | all scenarios |
 
 ## Reset script — all 20 products
 
