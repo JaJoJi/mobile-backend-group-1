@@ -1,43 +1,46 @@
 services:
   redis:
     container_name: redis
-    image: redis:7-alpine
+    image: redis:${REDIS_VERSION:-7-alpine}
     ports:
       - "6379:6379"
+    restart: unless-stopped
 
   postgres-primary:
-    image: bitnamilegacy/postgresql:16
+    image: bitnamilegacy/postgresql:${PG_VERSION:-16}
     environment:
       POSTGRESQL_REPLICATION_MODE: master
-      POSTGRESQL_USERNAME: app
-      POSTGRESQL_PASSWORD: app123
-      POSTGRESQL_DATABASE: flashsale
-      POSTGRESQL_REPLICATION_USER: repl
-      POSTGRESQL_REPLICATION_PASSWORD: repl123
-      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=1500"
+      POSTGRESQL_USERNAME: ${POSTGRES_USER:-app}
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRESQL_DATABASE: ${POSTGRES_DB:-flashsale}
+      POSTGRESQL_REPLICATION_USER: ${POSTGRES_REPLICATION_USER:-repl}
+      POSTGRESQL_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-changeme}
+      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=${POSTGRES_MAX_CONNECTIONS:-1500}"
     volumes:
       - pg-primary-data:/bitnami/postgresql
     ports:
       - "5432:5432"
+    restart: unless-stopped
 
   postgres-replica:
-    image: bitnamilegacy/postgresql:16
+    image: bitnamilegacy/postgresql:${PG_VERSION:-16}
     depends_on:
       - postgres-primary
     environment:
       POSTGRESQL_REPLICATION_MODE: slave
       POSTGRESQL_MASTER_HOST: postgres-primary
       POSTGRESQL_MASTER_PORT_NUMBER: 5432
-      POSTGRESQL_REPLICATION_USER: repl
-      POSTGRESQL_REPLICATION_PASSWORD: repl123
-      POSTGRESQL_USERNAME: app
-      POSTGRESQL_PASSWORD: app123
-      POSTGRESQL_DATABASE: flashsale
-      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=1500"
+      POSTGRESQL_REPLICATION_USER: ${POSTGRES_REPLICATION_USER:-repl}
+      POSTGRESQL_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-changeme}
+      POSTGRESQL_USERNAME: ${POSTGRES_USER:-app}
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRESQL_DATABASE: ${POSTGRES_DB:-flashsale}
+      POSTGRESQL_EXTRA_FLAGS: "-c max_connections=${POSTGRES_MAX_CONNECTIONS:-1500}"
     volumes:
       - pg-replica-data:/bitnami/postgresql
     ports:
       - "5433:5432"
+    restart: unless-stopped
 
   nest-1:
     container_name: nest-1
@@ -46,7 +49,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-1
     volumes:
@@ -61,6 +64,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-2:
     container_name: nest-2
@@ -69,7 +73,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-2
     volumes:
@@ -82,6 +86,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-3:
     container_name: nest-3
@@ -90,7 +95,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-3
     volumes:
@@ -103,6 +108,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-4:
     container_name: nest-4
@@ -111,7 +117,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-4
     volumes:
@@ -124,6 +130,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-5:
     container_name: nest-5
@@ -132,7 +139,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-5
     volumes:
@@ -145,6 +152,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-6:
     container_name: nest-6
@@ -153,7 +161,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-6
     volumes:
@@ -166,6 +174,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-7:
     container_name: nest-7
@@ -174,7 +183,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-7
     volumes:
@@ -187,6 +196,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-8:
     container_name: nest-8
@@ -195,7 +205,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-8
     volumes:
@@ -208,6 +218,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-9:
     container_name: nest-9
@@ -216,7 +227,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-9
       ROLE: worker
@@ -230,6 +241,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-10:
     container_name: nest-10
@@ -238,7 +250,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-10
       ROLE: worker
@@ -252,6 +264,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-11:
     container_name: nest-11
@@ -260,7 +273,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-11
       ROLE: worker
@@ -274,6 +287,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-12:
     container_name: nest-12
@@ -282,7 +296,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-12
       ROLE: worker
@@ -296,6 +310,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-13:
     container_name: nest-13
@@ -304,7 +319,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-13
       ROLE: worker
@@ -318,6 +333,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nest-14:
     container_name: nest-14
@@ -326,7 +342,7 @@ services:
       - postgres-primary
       - postgres-replica
       - redis
-    env_file: ./flash-sale-backend/.env.docker
+    env_file: .env
     environment:
       INSTANCE_ID: nest-14
       ROLE: worker
@@ -340,10 +356,11 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   nginx:
     container_name: nginx
-    image: nginx:1.27-alpine
+    image: nginx:${NGINX_VERSION:-1.27-alpine}
     ports:
       - "80:80"
     volumes:
@@ -363,9 +380,15 @@ services:
       nest-6:
         condition: service_healthy
       nest-7:
-        condition: service_healthy
+         condition: service_healthy
       nest-8:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
 
 volumes:
   pg-primary-data:
