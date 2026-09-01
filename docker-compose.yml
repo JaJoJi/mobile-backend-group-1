@@ -219,12 +219,13 @@ services:
     env_file: ./flash-sale-backend/.env.docker
     environment:
       INSTANCE_ID: nest-9
+      ROLE: worker
     volumes:
       - ./products-seed.json:/app/products-seed.json:ro
     healthcheck:
       test:
         - CMD-SHELL
-        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+        - 'pgrep -f "node dist/main" >/dev/null || exit 1'
       interval: 10s
       timeout: 5s
       retries: 5
@@ -240,12 +241,13 @@ services:
     env_file: ./flash-sale-backend/.env.docker
     environment:
       INSTANCE_ID: nest-10
+      ROLE: worker
     volumes:
       - ./products-seed.json:/app/products-seed.json:ro
     healthcheck:
       test:
         - CMD-SHELL
-        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+        - 'pgrep -f "node dist/main" >/dev/null || exit 1'
       interval: 10s
       timeout: 5s
       retries: 5
@@ -261,12 +263,13 @@ services:
     env_file: ./flash-sale-backend/.env.docker
     environment:
       INSTANCE_ID: nest-11
+      ROLE: worker
     volumes:
       - ./products-seed.json:/app/products-seed.json:ro
     healthcheck:
       test:
         - CMD-SHELL
-        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+        - 'pgrep -f "node dist/main" >/dev/null || exit 1'
       interval: 10s
       timeout: 5s
       retries: 5
@@ -282,12 +285,13 @@ services:
     env_file: ./flash-sale-backend/.env.docker
     environment:
       INSTANCE_ID: nest-12
+      ROLE: worker
     volumes:
       - ./products-seed.json:/app/products-seed.json:ro
     healthcheck:
       test:
         - CMD-SHELL
-        - 'node -e "require(\"http\").get(\"http://localhost:3000/health/ready\", r => process.exit(r.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))"'
+        - 'pgrep -f "node dist/main" >/dev/null || exit 1'
       interval: 10s
       timeout: 5s
       retries: 5
@@ -317,14 +321,6 @@ services:
       nest-7:
         condition: service_healthy
       nest-8:
-        condition: service_healthy
-      nest-9:
-        condition: service_healthy
-      nest-10:
-        condition: service_healthy
-      nest-11:
-        condition: service_healthy
-      nest-12:
         condition: service_healthy
 
 volumes:
